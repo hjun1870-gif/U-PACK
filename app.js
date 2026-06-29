@@ -861,14 +861,18 @@ function aggregateTotalSheet(workbook) {
   const totalSheet = workbook.Sheets[totalSheetName];
   if (!totalSheet) return;
 
-  // ① TOTAL 시트의 제품 목록 파악 (A열, 5행부터 마지막 행까지)
+  // ① TOTAL 시트의 기존 제품 목록 파악 (A열, 5행부터 마지막 행까지)
   //    엑셀 행 5 = SheetJS r 인덱스 4
   const productRows = {}; // { "M300": 5행(엑셀 행번호), "M500": 6, ... }
+  let nextEmptyRow = 5;
 
   for (let excelRow = 5; excelRow <= 300; excelRow++) {
     const addr = XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 }); // A열 = c:0
     const cell = totalSheet[addr];
-    if (!cell || cell.v === undefined || String(cell.v).trim() === "") break;
+    if (!cell || cell.v === undefined || String(cell.v).trim() === "") {
+      nextEmptyRow = excelRow;
+      break;
+    }
     const prodName = String(cell.v).trim();
     productRows[prodName] = excelRow;
   }
@@ -920,6 +924,43 @@ function aggregateTotalSheet(workbook) {
       }
     }
   });
+
+  // ②-2. TOTAL 시트에 없는 새로운 제품명이 다른 구역 시트에서 발견되면 목록 끝에 추가 등록
+  let isRangeUpdated = false;
+  for (const prodName of Object.keys(aggregated)) {
+    if (!productRows[prodName]) {
+      // 새로운 제품명을 TOTAL 시트 A열(제품명)에 기입
+      const aAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 0 }); // A열
+      totalSheet[aAddr] = { t: "s", v: prodName };
+
+      // G열(재고), I열(합계), K열(차이)에 기본 계산 수식 기입
+      const gAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 6 });  // G열: 재고
+      const iAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 8 });  // I열: 합계
+      const kAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 10 }); // K열: 차이
+
+      totalSheet[gAddr] = { t: "n", f: `((D${nextEmptyRow}*C${nextEmptyRow})+E${nextEmptyRow})*B${nextEmptyRow}+F${nextEmptyRow}` };
+      totalSheet[iAddr] = { t: "n", f: `G${nextEmptyRow}+H${nextEmptyRow}` };
+      totalSheet[kAddr] = { t: "n", f: `I${nextEmptyRow}-J${nextEmptyRow}` };
+
+      // productRows 매핑 정보 갱신 및 다음 빈 행 인덱스 증가
+      productRows[prodName] = nextEmptyRow;
+      nextEmptyRow++;
+      isRangeUpdated = true;
+    }
+  }
+
+  // 만약 새로운 제품이 추가되어 행 수가 늘어났다면 TOTAL 시트의 데이터 범위(!ref) 갱신
+  if (isRangeUpdated && totalSheet["!ref"]) {
+    try {
+      const range = XLSX.utils.decode_range(totalSheet["!ref"]);
+      if (nextEmptyRow - 1 > range.e.r) {
+        range.e.r = nextEmptyRow - 1;
+        totalSheet["!ref"] = XLSX.utils.encode_range(range);
+      }
+    } catch (e) {
+      console.error("TOTAL 시트의 범위(!ref)를 갱신하는 데 실패했습니다.", e);
+    }
+  }
 
   // ③ 집계 결과를 TOTAL 시트의 D열(P)과 E열(B)에 기입
   //    엑셀 D열 = 인덱스 3, E열 = 인덱스 4
