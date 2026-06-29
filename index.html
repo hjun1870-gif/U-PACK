@@ -27,12 +27,16 @@
 
       <!-- 컨트롤 바: 파일 업로드, 시트 변경, 검색, 다운로드 -->
       <div class="controls-section">
+        <!-- 동기화 상태 표시 배지 -->
+        <span id="syncStatus" class="sync-badge offline" style="padding: 0.6rem 1rem; font-size: 0.85rem; font-weight: 600; border-radius: 6px; display: inline-flex; align-items: center; gap: 0.3rem;">오프라인 모드</span>
+        
         <!-- 엑셀 파일 로드 버튼 및 데모 로드 버튼 -->
         <div class="file-upload-wrapper">
           <button class="file-upload-btn">엑셀 파일 업로드</button>
           <input type="file" id="fileInput" class="file-upload-input" accept=".xlsx, .xls">
         </div>
         <button id="demoBtn" class="btn-secondary" style="padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600;">데모 데이터 불러오기</button>
+        <button id="dbConfigBtn" class="btn-secondary" style="padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600; background: rgba(6, 182, 212, 0.05); border: 1px solid rgba(6, 182, 212, 0.4); color: #06b6d4;">⚙️ DB 설정</button>
 
         <!-- 시트 선택 드롭다운 -->
         <div class="select-wrapper">
@@ -163,6 +167,42 @@
     </div>
   </div>
 
+  <!-- DB 설정 모달 다이얼로그 (Overlay) -->
+  <div id="dbConfigModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 480px;">
+      
+      <div class="modal-header">
+        <h3 class="modal-title">⚙️ Supabase 실시간 동기화 설정</h3>
+        <button id="closeDbModal" class="close-btn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 1rem;">
+          Supabase 프로젝트 정보를 기입하면 PC와 모바일 간 실시간으로 데이터가 연동됩니다. 입력하지 않으면 로컬 엑셀 파일 업로드 모드로 작동합니다.
+        </p>
+        
+        <div class="form-group">
+          <label for="inputDbUrl">Supabase Project URL</label>
+          <input type="text" id="inputDbUrl" class="form-control" placeholder="https://your-project.supabase.co">
+        </div>
+
+        <div class="form-group">
+          <label for="inputDbKey">Supabase Anon Key</label>
+          <input type="text" id="inputDbKey" class="form-control" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="disconnectDbBtn" class="btn-secondary" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); color: #ef4444;">연동 해제</button>
+        <button id="saveDbConfigBtn" class="btn-primary">연동 완료</button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Supabase JS 라이브러리 CDN 로드 및 연동 설정 파일 로드 -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js" defer></script>
   <!-- 애플리케이션 비즈니스 로직 스크립트 연결 -->
   <script src="app.js"></script>
 </body>

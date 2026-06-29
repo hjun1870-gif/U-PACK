@@ -12,6 +12,11 @@ let currentSheetName = "";  // 현재 화면에 렌더링 중인 시트 이름
 let currentSheetData = null; // 현재 시트의 파싱된 엑셀 데이터 객체
 let selectedCellInfo = null; // 현재 편집 모달이 열려 있는 셀의 정보
 
+// Supabase 연동 상태 변수
+let supabase = null;
+let isOnline = false;
+let productsMetadataCache = {}; // 제품 메타데이터 캐시 (TOTAL 시트 갱신용)
+
 // DOM 요소 캐싱
 const fileInput = document.getElementById("fileInput");
 const demoBtn = document.getElementById("demoBtn");
@@ -38,6 +43,16 @@ const inputBox = document.getElementById("inputBox");
 const cancelBtn = document.getElementById("cancelBtn");
 const saveBtn = document.getElementById("saveBtn");
 
+// DB 설정 모달 캐싱
+const dbConfigBtn = document.getElementById("dbConfigBtn");
+const dbConfigModal = document.getElementById("dbConfigModal");
+const closeDbModal = document.getElementById("closeDbModal");
+const inputDbUrl = document.getElementById("inputDbUrl");
+const inputDbKey = document.getElementById("inputDbKey");
+const disconnectDbBtn = document.getElementById("disconnectDbBtn");
+const saveDbConfigBtn = document.getElementById("saveDbConfigBtn");
+const syncStatusEl = document.getElementById("syncStatus");
+
 /**
  * 1. 이벤트 리스너 등록
  */
@@ -58,6 +73,15 @@ window.addEventListener("click", (e) => {
   if (e.target === editModal) hideModal();
 });
 saveBtn.addEventListener("click", saveCellChanges);
+
+// DB 설정 모달 리스너
+dbConfigBtn.addEventListener("click", showDbModal);
+closeDbModal.addEventListener("click", hideDbModal);
+saveDbConfigBtn.addEventListener("click", saveDbConfig);
+disconnectDbBtn.addEventListener("click", disconnectDb);
+window.addEventListener("click", (e) => {
+  if (e.target === dbConfigModal) hideDbModal();
+});
 
 // 검색창 외부 영역 클릭 시 검색 결과 래퍼 닫기
 document.addEventListener("click", (e) => {
@@ -93,6 +117,13 @@ function handleFileSelect(e) {
       const defaultSheet = workbook.SheetNames.includes("B2") ? "B2" : workbook.SheetNames[0];
       sheetSelect.value = defaultSheet;
       renderActiveSheet(defaultSheet);
+
+      // --- 추가: Supabase 데이터베이스 적재 여부 확인 ---
+      if (isOnline) {
+        if (confirm("실시간 동기화(Supabase)가 활성화되어 있습니다. 업로드한 엑셀 파일 데이터로 데이터베이스를 덮어쓰시겠습니까?")) {
+          importWorkbookToSupabase();
+        }
+      }
     } catch (err) {
       alert("엑셀 파일을 파싱하는 데 실패했습니다. 파일이 손상되었거나 유효한 엑셀 형식이 아닙니다.");
       console.error(err);
@@ -760,7 +791,7 @@ function hideModal() {
 /**
  * 사용자가 수정한 재고를 엑셀 데이터 구조에 반영하고 화면을 새로고침합니다.
  */
-function saveCellChanges() {
+async function saveCellChanges() {
   if (!selectedCellInfo || !currentSheetData) return;
 
   const newProduct = inputProduct.value.trim();
@@ -775,10 +806,45 @@ function saveCellChanges() {
   updateExcelCellValue(sheet, cellInfo.palletCellAddress, newPallet, 'n');
   updateExcelCellValue(sheet, cellInfo.boxCellAddress, newBox, 'n');
 
-  // 2. 화면 갱신 (전체 렌더링을 다시 호출하여 합계 및 레이아웃을 일괄 동기화)
+  // 2. 온라인 모드면 Supabase에 비동기 저장
+  if (isOnline) {
+    try {
+      if (newProduct === "" && newPallet === 0 && newBox === 0) {
+        // 비어있는 데이터는 DB에서 삭제 처리
+        await supabase
+          .from('rack_inventory')
+          .delete()
+          .match({
+            sheet_name: currentSheetName,
+            rack_row: selectedCellInfo.row,
+            rack_col: selectedCellInfo.col
+          });
+      } else {
+        // 데이터가 존재하면 Upsert 처리
+        const { error } = await supabase
+          .from('rack_inventory')
+          .upsert({
+            sheet_name: currentSheetName,
+            rack_row: selectedCellInfo.row,
+            rack_col: selectedCellInfo.col,
+            product_name: newProduct,
+            pallet_qty: newPallet,
+            box_qty: newBox,
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'sheet_name,rack_row,rack_col' });
+          
+        if (error) throw error;
+      }
+    } catch (e) {
+      alert("서버 데이터 동기화에 실패했습니다. (오프라인 변경만 적용됨)");
+      console.error(e);
+    }
+  }
+
+  // 3. 화면 갱신
   renderActiveSheet(currentSheetName);
 
-  // 3. 모달 닫기
+  // 4. 모달 닫기
   hideModal();
 }
 
@@ -1290,3 +1356,353 @@ function applyTotalSheetStyles(sheet) {
   if (!sheet["!rows"]) sheet["!rows"] = [];
   sheet["!rows"][3] = { hpt: 22 }; // 헤더 행(4행) 높이
 }
+
+/**
+ * 7. Supabase 실시간 동기화 유틸리티 함수군
+ */
+
+// Supabase 연결 초기화 및 연동 상태 체크
+function initSupabase() {
+  const url = window.SUPABASE_URL || localStorage.getItem("supabase_url") || "";
+  const key = window.SUPABASE_ANON_KEY || localStorage.getItem("supabase_anon_key") || "";
+
+  if (url && key && window.supabase) {
+    try {
+      supabase = window.supabase.createClient(url, key);
+      isOnline = true;
+      syncStatusEl.textContent = "🟢 실시간 동기화 중";
+      syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+      syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+      syncStatusEl.style.color = "#10b981";
+      
+      // 실시간 데이터 변경 채널 구독
+      subscribeToRealtime();
+      // DB 서버로부터 데이터 내려받기
+      loadDataFromSupabase();
+    } catch (e) {
+      console.error("Supabase 초기화 실패:", e);
+      setOfflineMode();
+    }
+  } else {
+    setOfflineMode();
+  }
+}
+
+// 오프라인 상태 설정
+function setOfflineMode() {
+  isOnline = false;
+  supabase = null;
+  syncStatusEl.textContent = "🔴 오프라인 모드";
+  syncStatusEl.style.background = "rgba(239, 68, 68, 0.1)";
+  syncStatusEl.style.border = "1px solid rgba(239, 68, 68, 0.4)";
+  syncStatusEl.style.color = "#ef4444";
+}
+
+// Supabase 서버 데이터 로드
+async function loadDataFromSupabase() {
+  try {
+    syncStatusEl.textContent = "🟡 데이터 로드 중...";
+    
+    // 1. 서버에 올라가 있는 재고조사표 원본 템플릿 로드
+    const response = await fetch('재고조사표.xlsx');
+    if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
+    const arrayBuffer = await response.arrayBuffer();
+    currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array" });
+    
+    // 2. Supabase에서 최신 랙 데이터 일괄 조회
+    const { data: dbRacks, error: rackError } = await supabase
+      .from('rack_inventory')
+      .select('*');
+    if (rackError) throw rackError;
+
+    // 3. Supabase에서 최신 제품 메타데이터 조회
+    const { data: dbMeta, error: metaError } = await supabase
+      .from('product_metadata')
+      .select('*');
+    if (metaError) throw metaError;
+
+    // 4. 로컬 메모리 워크북 객체에 DB 데이터 반영
+    applyDbDataToWorkbook(dbRacks, dbMeta);
+
+    // 5. 가이드 숨기고 그리드 표시 영역 세팅
+    updateSheetDropdown(currentWorkbook.SheetNames);
+    emptyGuide.style.display = "none";
+    gridBoard.style.display = "grid";
+    exportBtn.style.display = "inline-block";
+
+    const defaultSheet = currentWorkbook.SheetNames.includes("B2") ? "B2" : currentWorkbook.SheetNames[0];
+    sheetSelect.value = defaultSheet;
+    renderActiveSheet(defaultSheet);
+    
+    syncStatusEl.textContent = "🟢 실시간 동기화 중";
+  } catch (err) {
+    console.error("데이터베이스 로드 실패. 로컬 모드로 자동 백업 전환:", err);
+    alert("데이터베이스 연동에 실패했습니다. 오프라인 모드로 연동합니다.");
+    setOfflineMode();
+  }
+}
+
+// 데이터베이스 조회 정보를 엑셀 워크북에 매핑해 넣는 로직
+function applyDbDataToWorkbook(dbRacks, dbMeta) {
+  const totalSheetName = currentWorkbook.SheetNames.find(
+    (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
+  );
+  
+  // 제품 메타데이터 로컬 캐시 주입
+  productsMetadataCache = {};
+  dbMeta.forEach((meta) => {
+    productsMetadataCache[meta.product_name] = meta;
+  });
+
+  // 모든 구역 랙 셀 비우고 초기화
+  currentWorkbook.SheetNames.forEach(sheetName => {
+    if (sheetName === totalSheetName) return;
+    const sheet = currentWorkbook.Sheets[sheetName];
+    if (!sheet) return;
+    const colMapping = detectColumnMapping(sheet);
+
+    for (let r = 1; r <= 18; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      const qtyRowIdx  = 8 + 2 * (r - 1);
+      for (let c = 1; c <= 18; c++) {
+        const pCol = colMapping[c];
+        if (pCol === undefined) continue;
+        const bCol = pCol + 1;
+        const prodAddr   = XLSX.utils.encode_cell({ r: prodRowIdx, c: pCol });
+        const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx,  c: pCol });
+        const boxAddr    = XLSX.utils.encode_cell({ r: qtyRowIdx,  c: bCol });
+
+        updateExcelCellValue(sheet, prodAddr, "", "s");
+        updateExcelCellValue(sheet, palletAddr, 0, "n");
+        updateExcelCellValue(sheet, boxAddr, 0, "n");
+      }
+    }
+  });
+
+  // DB 랙 데이터를 엑셀 메모리에 덮어쓰기
+  dbRacks.forEach((rack) => {
+    const sheet = currentWorkbook.Sheets[rack.sheet_name];
+    if (!sheet) return;
+    const colMapping = detectColumnMapping(sheet);
+    const pColIdx = colMapping[rack.rack_col];
+    if (pColIdx === undefined) return;
+    const bColIdx = pColIdx + 1;
+
+    const prodRowIdx = 7 + 2 * (rack.rack_row - 1);
+    const qtyRowIdx = 8 + 2 * (rack.rack_row - 1);
+
+    const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pColIdx });
+    const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pColIdx });
+    const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: bColIdx });
+
+    updateExcelCellValue(sheet, prodAddr, rack.product_name, 's');
+    updateExcelCellValue(sheet, palletAddr, rack.pallet_qty, 'n');
+    updateExcelCellValue(sheet, boxAddr, rack.box_qty, 'n');
+  });
+}
+
+// 엑셀 업로드 시 엑셀 데이터를 Supabase 클라우드로 일괄 가져오는 적재기
+async function importWorkbookToSupabase() {
+  try {
+    syncStatusEl.textContent = "🟡 DB 덮어쓰기 중...";
+    
+    // 1. 기존 데이터 초기화 (완전 덮어쓰기)
+    const { error: delRackErr } = await supabase.from('rack_inventory').delete().neq('sheet_name', '');
+    if (delRackErr) throw delRackErr;
+
+    const { error: delMetaErr } = await supabase.from('product_metadata').delete().neq('product_name', '');
+    if (delMetaErr) throw delMetaErr;
+
+    const totalSheetName = currentWorkbook.SheetNames.find(
+      (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
+    );
+    const totalSheet = totalSheetName ? currentWorkbook.Sheets[totalSheetName] : null;
+
+    const rackInserts = [];
+    const metaInserts = [];
+
+    // TOTAL 시트에서 메타데이터 읽기
+    if (totalSheet) {
+      for (let excelRow = 5; excelRow <= 300; excelRow++) {
+        const aAddr = XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 }); // A열
+        const aCell = totalSheet[aAddr];
+        if (!aCell || aCell.v === undefined || String(aCell.v).trim() === "") break;
+        const prodName = String(aCell.v).trim();
+
+        const bCell = totalSheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 1 })]; // B열
+        const cCell = totalSheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 2 })]; // C열
+        const fCell = totalSheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 5 })]; // F열
+        const hCell = totalSheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 7 })]; // H열
+        const jCell = totalSheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 9 })]; // J열
+
+        metaInserts.push({
+          product_name: prodName,
+          ipsuryang: bCell && bCell.v !== undefined ? Number(bCell.v) || 0 : 0,
+          box_danyi: cCell && cCell.v !== undefined ? Number(cCell.v) || 0 : 0,
+          janryang: fCell && fCell.v !== undefined ? Number(fCell.v) || 0 : 0,
+          chulgo: hCell && hCell.v !== undefined ? Number(hCell.v) || 0 : 0,
+          panmae_ilbo: jCell && jCell.v !== undefined ? Number(jCell.v) || 0 : 0
+        });
+      }
+    }
+
+    // 각 구역 시트에서 랙 리스트 긁기
+    currentWorkbook.SheetNames.forEach((sheetName) => {
+      if (sheetName === totalSheetName) return;
+      const sheet = currentWorkbook.Sheets[sheetName];
+      if (!sheet) return;
+
+      const colMapping = detectColumnMapping(sheet);
+      for (let r = 1; r <= 18; r++) {
+        const prodRowIdx = 7 + 2 * (r - 1);
+        const qtyRowIdx  = 8 + 2 * (r - 1);
+
+        for (let c = 1; c <= 18; c++) {
+          const cellData = getRackCellData(sheet, colMapping, r, c, prodRowIdx, qtyRowIdx);
+          if (cellData.product) {
+            rackInserts.push({
+              sheet_name: sheetName,
+              rack_row: r,
+              rack_col: c,
+              product_name: cellData.product,
+              pallet_qty: cellData.pallet,
+              box_qty: cellData.box
+            });
+          }
+        }
+      }
+    });
+
+    // 2. Supabase 데이터 주입
+    if (metaInserts.length > 0) {
+      const { error: metaInsertErr } = await supabase.from('product_metadata').insert(metaInserts);
+      if (metaInsertErr) throw metaInsertErr;
+    }
+
+    if (rackInserts.length > 0) {
+      // 대량 데이터 분할 주입 (Supabase 1회 제한 방지)
+      const chunkSize = 100;
+      for (let i = 0; i < rackInserts.length; i += chunkSize) {
+        const chunk = rackInserts.slice(i, i + chunkSize);
+        const { error: rackInsertErr } = await supabase.from('rack_inventory').insert(chunk);
+        if (rackInsertErr) throw rackInsertErr;
+      }
+    }
+
+    alert("로컬 엑셀 데이터가 Supabase DB에 실시간 동기화로 백업되었습니다!");
+    initSupabase(); // 재로드
+  } catch (err) {
+    alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
+    console.error(err);
+    setOfflineMode();
+  }
+}
+
+// 실시간 DB 변경사항 구독 등록
+let realtimeChannel = null;
+function subscribeToRealtime() {
+  if (realtimeChannel) {
+    supabase.removeChannel(realtimeChannel);
+  }
+
+  realtimeChannel = supabase
+    .channel('public:rack_inventory')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rack_inventory' }, (payload) => {
+      handleRealtimeRackChange(payload);
+    })
+    .subscribe();
+}
+
+// 실시간 기기 변경에 대한 수신 처리기
+function handleRealtimeRackChange(payload) {
+  const { eventType, new: newRow, old: oldRow } = payload;
+  
+  // 1. 메모리 상의 워크북 객체 실시간 수정
+  if (eventType === 'DELETE') {
+    const sheet = currentWorkbook.Sheets[oldRow.sheet_name];
+    if (sheet) {
+      const colMapping = detectColumnMapping(sheet);
+      const pColIdx = colMapping[oldRow.rack_col];
+      if (pColIdx !== undefined) {
+        const prodRowIdx = 7 + 2 * (oldRow.rack_row - 1);
+        const qtyRowIdx = 8 + 2 * (oldRow.rack_row - 1);
+        
+        const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pColIdx });
+        const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pColIdx });
+        const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pColIdx + 1 });
+
+        updateExcelCellValue(sheet, prodAddr, "", "s");
+        updateExcelCellValue(sheet, palletAddr, 0, "n");
+        updateExcelCellValue(sheet, boxAddr, 0, "n");
+      }
+    }
+  } else {
+    // INSERT, UPDATE
+    const sheet = currentWorkbook.Sheets[newRow.sheet_name];
+    if (sheet) {
+      const colMapping = detectColumnMapping(sheet);
+      const pColIdx = colMapping[newRow.rack_col];
+      if (pColIdx !== undefined) {
+        const prodRowIdx = 7 + 2 * (newRow.rack_row - 1);
+        const qtyRowIdx = 8 + 2 * (newRow.rack_row - 1);
+        
+        const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pColIdx });
+        const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pColIdx });
+        const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pColIdx + 1 });
+
+        updateExcelCellValue(sheet, prodAddr, newRow.product_name, "s");
+        updateExcelCellValue(sheet, palletAddr, newRow.pallet_qty, "n");
+        updateExcelCellValue(sheet, boxAddr, newRow.box_qty, "n");
+      }
+    }
+  }
+
+  // 2. 화면 동적 새로고침 (현재 사용자가 해당 시트를 보는 중이고 수정 모달이 닫혀있는 상태일 때)
+  const activeSheetName = currentSheetName;
+  const isEditing = editModal.classList.contains("show");
+  const affectedSheet = eventType === 'DELETE' ? oldRow.sheet_name : newRow.sheet_name;
+  
+  if (activeSheetName === affectedSheet && !isEditing) {
+    renderActiveSheet(currentSheetName);
+  }
+}
+
+// DB 설정 모달 열기/닫기/제어
+function showDbModal() {
+  inputDbUrl.value = window.SUPABASE_URL || localStorage.getItem("supabase_url") || "";
+  inputDbKey.value = window.SUPABASE_ANON_KEY || localStorage.getItem("supabase_anon_key") || "";
+  dbConfigModal.classList.add("show");
+}
+
+function hideDbModal() {
+  dbConfigModal.classList.remove("show");
+}
+
+function saveDbConfig() {
+  const url = inputDbUrl.value.trim();
+  const key = inputDbKey.value.trim();
+  
+  if (!url || !key) {
+    alert("URL과 Anon Key를 모두 입력해야 저장됩니다.");
+    return;
+  }
+  
+  localStorage.setItem("supabase_url", url);
+  localStorage.setItem("supabase_anon_key", key);
+  hideDbModal();
+  alert("설정이 저장되었습니다! 실시간 동기화를 위해 동적 연결을 활성화합니다.");
+  window.location.reload();
+}
+
+function disconnectDb() {
+  if (confirm("Supabase 실시간 연동을 해제하시겠습니까? (로컬 오프라인 엑셀 방식으로 돌아갑니다.)")) {
+    localStorage.removeItem("supabase_url");
+    localStorage.removeItem("supabase_anon_key");
+    hideDbModal();
+    alert("연동 해제 완료.");
+    window.location.reload();
+  }
+}
+
+// 앱 구동 시 자동 데이터베이스 초기화 진행
+initSupabase();
