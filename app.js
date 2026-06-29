@@ -1412,21 +1412,41 @@ async function loadDataFromSupabase() {
     syncStatusEl.textContent = "🟡 데이터 로드 중...";
     
     // 1. 서버에 올라가 있는 재고조사표 원본 템플릿 로드
-    const response = await fetch('재고조사표.xlsx');
+    let response;
+    try {
+      response = await fetch('재고조사표.xlsx');
+    } catch (e) {
+      throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+    }
     if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
+    
     const arrayBuffer = await response.arrayBuffer();
     currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array" });
     
     // 2. Supabase에서 최신 랙 데이터 일괄 조회
-    const { data: dbRacks, error: rackError } = await supabaseClient
-      .from('rack_inventory')
-      .select('*');
+    let dbRacks, rackError;
+    try {
+      const res = await supabaseClient
+        .from('rack_inventory')
+        .select('*');
+      dbRacks = res.data;
+      rackError = res.error;
+    } catch (e) {
+      throw new Error("Supabase 서버(rack_inventory) 연결에 실패했습니다. (Failed to fetch)\n원인: 광고 차단 프로그램(AdBlock 등)이 Supabase 도메인을 차단하고 있을 수 있습니다.");
+    }
     if (rackError) throw rackError;
 
     // 3. Supabase에서 최신 제품 메타데이터 조회
-    const { data: dbMeta, error: metaError } = await supabaseClient
-      .from('product_metadata')
-      .select('*');
+    let dbMeta, metaError;
+    try {
+      const res = await supabaseClient
+        .from('product_metadata')
+        .select('*');
+      dbMeta = res.data;
+      metaError = res.error;
+    } catch (e) {
+      throw new Error("Supabase 서버(product_metadata) 연결에 실패했습니다.");
+    }
     if (metaError) throw metaError;
 
     // 4. 로컬 메모리 워크북 객체에 DB 데이터 반영
