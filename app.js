@@ -1366,6 +1366,13 @@ function initSupabase() {
   const url = window.SUPABASE_URL || localStorage.getItem("supabase_url") || "";
   const key = window.SUPABASE_ANON_KEY || localStorage.getItem("supabase_anon_key") || "";
 
+  // URL과 Key는 입력되었는데 Supabase 라이브러리가 로드되지 않은 경우 경고
+  if (url && key && !window.supabase) {
+    alert("Supabase 라이브러리(SDK)가 브라우저에 로드되지 않았습니다.\n네트워크 상태나 광고 차단(AdBlock) 프로그램이 CDN 주소를 차단했는지 확인해 주세요.");
+    setOfflineMode();
+    return;
+  }
+
   if (url && key && window.supabase) {
     try {
       supabaseClient = window.supabase.createClient(url, key);
@@ -1380,6 +1387,7 @@ function initSupabase() {
       // DB 서버로부터 데이터 내려받기
       loadDataFromSupabase();
     } catch (e) {
+      alert("Supabase 클라이언트 초기화 중 오류가 발생했습니다:\n" + e.message);
       console.error("Supabase 초기화 실패:", e);
       setOfflineMode();
     }
