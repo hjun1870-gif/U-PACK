@@ -1437,7 +1437,7 @@ async function loadDataFromSupabase() {
     syncStatusEl.textContent = "🟢 실시간 동기화 중";
   } catch (err) {
     console.error("데이터베이스 로드 실패. 로컬 모드로 자동 백업 전환:", err);
-    alert("데이터베이스 연동에 실패했습니다. 오프라인 모드로 연동합니다.");
+    alert("데이터베이스 연동에 실패했습니다.\n오류 내용: " + (err.message || err) + "\n\n오프라인 모드로 연동합니다.");
     setOfflineMode();
   }
 }
