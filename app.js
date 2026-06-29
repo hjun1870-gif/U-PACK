@@ -13,7 +13,7 @@ let currentSheetData = null; // 현재 시트의 파싱된 엑셀 데이터 객�
 let selectedCellInfo = null; // 현재 편집 모달이 열려 있는 셀의 정보
 
 // Supabase 연동 상태 변수
-let supabase = null;
+let supabaseClient = null;
 let isOnline = false;
 let productsMetadataCache = {}; // 제품 메타데이터 캐시 (TOTAL 시트 갱신용)
 
@@ -811,7 +811,7 @@ async function saveCellChanges() {
     try {
       if (newProduct === "" && newPallet === 0 && newBox === 0) {
         // 비어있는 데이터는 DB에서 삭제 처리
-        await supabase
+        await supabaseClient
           .from('rack_inventory')
           .delete()
           .match({
@@ -821,7 +821,7 @@ async function saveCellChanges() {
           });
       } else {
         // 데이터가 존재하면 Upsert 처리
-        const { error } = await supabase
+        const { error } = await supabaseClient
           .from('rack_inventory')
           .upsert({
             sheet_name: currentSheetName,
@@ -1368,7 +1368,7 @@ function initSupabase() {
 
   if (url && key && window.supabase) {
     try {
-      supabase = window.supabase.createClient(url, key);
+      supabaseClient = window.supabase.createClient(url, key);
       isOnline = true;
       syncStatusEl.textContent = "🟢 실시간 동기화 중";
       syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
@@ -1391,7 +1391,7 @@ function initSupabase() {
 // 오프라인 상태 설정
 function setOfflineMode() {
   isOnline = false;
-  supabase = null;
+  supabaseClient = null;
   syncStatusEl.textContent = "🔴 오프라인 모드";
   syncStatusEl.style.background = "rgba(239, 68, 68, 0.1)";
   syncStatusEl.style.border = "1px solid rgba(239, 68, 68, 0.4)";
@@ -1410,13 +1410,13 @@ async function loadDataFromSupabase() {
     currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array" });
     
     // 2. Supabase에서 최신 랙 데이터 일괄 조회
-    const { data: dbRacks, error: rackError } = await supabase
+    const { data: dbRacks, error: rackError } = await supabaseClient
       .from('rack_inventory')
       .select('*');
     if (rackError) throw rackError;
 
     // 3. Supabase에서 최신 제품 메타데이터 조회
-    const { data: dbMeta, error: metaError } = await supabase
+    const { data: dbMeta, error: metaError } = await supabaseClient
       .from('product_metadata')
       .select('*');
     if (metaError) throw metaError;
@@ -1507,10 +1507,10 @@ async function importWorkbookToSupabase() {
     syncStatusEl.textContent = "🟡 DB 덮어쓰기 중...";
     
     // 1. 기존 데이터 초기화 (완전 덮어쓰기)
-    const { error: delRackErr } = await supabase.from('rack_inventory').delete().neq('sheet_name', '');
+    const { error: delRackErr } = await supabaseClient.from('rack_inventory').delete().neq('sheet_name', '');
     if (delRackErr) throw delRackErr;
 
-    const { error: delMetaErr } = await supabase.from('product_metadata').delete().neq('product_name', '');
+    const { error: delMetaErr } = await supabaseClient.from('product_metadata').delete().neq('product_name', '');
     if (delMetaErr) throw delMetaErr;
 
     const totalSheetName = currentWorkbook.SheetNames.find(
@@ -1575,7 +1575,7 @@ async function importWorkbookToSupabase() {
 
     // 2. Supabase 데이터 주입
     if (metaInserts.length > 0) {
-      const { error: metaInsertErr } = await supabase.from('product_metadata').insert(metaInserts);
+      const { error: metaInsertErr } = await supabaseClient.from('product_metadata').insert(metaInserts);
       if (metaInsertErr) throw metaInsertErr;
     }
 
@@ -1584,7 +1584,7 @@ async function importWorkbookToSupabase() {
       const chunkSize = 100;
       for (let i = 0; i < rackInserts.length; i += chunkSize) {
         const chunk = rackInserts.slice(i, i + chunkSize);
-        const { error: rackInsertErr } = await supabase.from('rack_inventory').insert(chunk);
+        const { error: rackInsertErr } = await supabaseClient.from('rack_inventory').insert(chunk);
         if (rackInsertErr) throw rackInsertErr;
       }
     }
@@ -1602,10 +1602,10 @@ async function importWorkbookToSupabase() {
 let realtimeChannel = null;
 function subscribeToRealtime() {
   if (realtimeChannel) {
-    supabase.removeChannel(realtimeChannel);
+    supabaseClient.removeChannel(realtimeChannel);
   }
 
-  realtimeChannel = supabase
+  realtimeChannel = supabaseClient
     .channel('public:rack_inventory')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'rack_inventory' }, (payload) => {
       handleRealtimeRackChange(payload);
