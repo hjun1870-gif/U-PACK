@@ -16,6 +16,8 @@ let selectedCellInfo = null; // 현재 편집 모달이 열려 있는 셀의 정
 let supabaseClient = null;
 let isOnline = false;
 let productsMetadataCache = {}; // 제품 메타데이터 캐시 (TOTAL 시트 갱신용)
+let isUserLocalWorkbook = false; // 사용자가 업로드한 엑셀이 우선 (Supabase 템플릿 덮어쓰기 방지)
+let supabaseLoadToken = 0; // 진행 중인 Supabase 로드 취소용 토큰
 
 // DOM 요소 캐싱
 const fileInput = document.getElementById("fileInput");
@@ -160,9 +162,16 @@ function getWarehouseSheetNames(workbook) {
 }
 
 /**
- * 창고 시트의 표시용 제목 파싱 (예: "<재고조사표 - B1>" → "B1")
+ * 창고 시트의 표시용 제목 — 시트 탭 이름(셀, 루 등)을 우선 사용
  */
 function parseSheetDisplayTitle(sheet, sheetName) {
+  return sheetName;
+}
+
+/**
+ * 시트 내부 헤더에서 구역 라벨 추출 (입구 표시용, 탭 이름과 다를 수 있음)
+ */
+function parseSheetHeaderLabel(sheet, sheetName) {
   if (!sheet || !sheet["!ref"]) return sheetName;
 
   try {
@@ -177,7 +186,7 @@ function parseSheetDisplayTitle(sheet, sheetName) {
       }
     }
   } catch (e) {
-    console.warn("시트 제목 파싱 실패:", e);
+    console.warn("시트 헤더 라벨 파싱 실패:", e);
   }
   return sheetName;
 }
@@ -192,8 +201,6 @@ function resolveDefaultSheetName(workbook, preferredName) {
   if (preferredName && warehouseSheets.includes(preferredName)) {
     return preferredName;
   }
-  if (warehouseSheets.includes("B2")) return "B2";
-  if (warehouseSheets.includes("B1")) return "B1";
   return warehouseSheets[0];
 }
 
@@ -247,7 +254,7 @@ function loadWorkbookFromFile(file) {
     const data = new Uint8Array(e.target.result);
     try {
       const workbook = XLSX.read(data, { type: "array", cellStyles: true });
-      applyLoadedWorkbook(workbook);
+      applyLoadedWorkbook(workbook, undefined, true);
     } catch (err) {
       alert("엑셀 파일을 파싱하는 데 실패했습니다. 파일이 손상되었거나 유효한 엑셀 형식이 아닙니다.");
       console.error(err);
@@ -258,9 +265,16 @@ function loadWorkbookFromFile(file) {
 
 /**
  * 파싱된 워크북을 앱 상태에 반영하고 첫 창고 시트 렌더링
+ * @param {boolean} fromUserUpload - 사용자가 직접 업로드한 파일이면 Supabase 템플릿 덮어쓰기 방지
  */
-function applyLoadedWorkbook(workbook, preferredSheetName) {
+function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = false) {
   const previousSheet = currentSheetName;
+
+  if (fromUserUpload) {
+    isUserLocalWorkbook = true;
+    supabaseLoadToken += 1;
+  }
+
   currentWorkbook = workbook;
 
   const warehouseSheets = getWarehouseSheetNames(workbook);
@@ -457,9 +471,7 @@ function updateSheetDropdown(sheetNames) {
   sheetNames.forEach((name) => {
     const option = document.createElement("option");
     option.value = name;
-    const sheet = currentWorkbook?.Sheets?.[name];
-    const displayTitle = sheet ? parseSheetDisplayTitle(sheet, name) : name;
-    option.textContent = displayTitle === name ? name : `${name} (${displayTitle})`;
+    option.textContent = name;
     sheetSelect.appendChild(option);
   });
 }
@@ -1769,19 +1781,30 @@ function setOfflineMode() {
 
 // Supabase 서버 데이터 로드
 async function loadDataFromSupabase() {
+  const loadToken = ++supabaseLoadToken;
+
   try {
+    if (isUserLocalWorkbook) {
+      syncStatusEl.textContent = "🟢 실시간 동기화 중 (로컬 엑셀 우선)";
+      return;
+    }
+
     syncStatusEl.textContent = "🟡 데이터 로드 중...";
     
     // 1. 서버에 올라가 있는 재고조사표 원본 템플릿 로드
     let response;
     try {
-      response = await fetch('재고조사표.xlsx');
+      response = await fetch(`재고조사표.xlsx?v=${Date.now()}`, { cache: "no-store" });
     } catch (e) {
       throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
     }
     if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
+
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
     
     const arrayBuffer = await response.arrayBuffer();
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
+
     currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array", cellStyles: true });
     
     // 2. Supabase에서 최신 랙 데이터 일괄 조회
@@ -1797,6 +1820,8 @@ async function loadDataFromSupabase() {
     }
     if (rackError) throw rackError;
 
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
+
     // 3. Supabase에서 최신 제품 메타데이터 조회
     let dbMeta, metaError;
     try {
@@ -1809,6 +1834,8 @@ async function loadDataFromSupabase() {
       throw new Error("Supabase 서버(product_metadata) 연결에 실패했습니다.");
     }
     if (metaError) throw metaError;
+
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
 
     // 4. 로컬 메모리 워크북 객체에 DB 데이터 반영
     applyDbDataToWorkbook(dbRacks, dbMeta);
@@ -1825,6 +1852,7 @@ async function loadDataFromSupabase() {
     
     syncStatusEl.textContent = "🟢 실시간 동기화 중";
   } catch (err) {
+    if (loadToken !== supabaseLoadToken) return;
     console.error("데이터베이스 로드 실패. 로컬 모드로 자동 백업 전환:", err);
     alert("데이터베이스 연동에 실패했습니다.\n오류 내용: " + (err.message || err) + "\n\n오프라인 모드로 연동합니다.");
     setOfflineMode();
@@ -1981,7 +2009,7 @@ async function importWorkbookToSupabase() {
     }
 
     alert("로컬 엑셀 데이터가 Supabase DB에 실시간 동기화로 백업되었습니다!");
-    initSupabase(); // 재로드
+    syncStatusEl.textContent = "🟢 실시간 동기화 중 (로컬 엑셀 우선)";
   } catch (err) {
     alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
     console.error(err);
@@ -2006,6 +2034,10 @@ function subscribeToRealtime() {
 
 // 실시간 기기 변경에 대한 수신 처리기
 function handleRealtimeRackChange(payload) {
+  // 사용자가 업로드한 엑셀(셀/루/리 등)이 우선 — DB의 구 B1/B2 시트명으로 덮어쓰지 않음
+  if (isUserLocalWorkbook) return;
+  if (!currentWorkbook) return;
+
   const { eventType, new: newRow, old: oldRow } = payload;
   
   // 1. 메모리 상의 워크북 객체 실시간 수정
