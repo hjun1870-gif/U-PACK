@@ -18,6 +18,7 @@ let isOnline = false;
 let productsMetadataCache = {}; // 제품 메타데이터 캐시 (TOTAL 시트 갱신용)
 let isUserLocalWorkbook = false; // 사용자가 업로드한 엑셀이 우선 (Supabase 템플릿 덮어쓰기 방지)
 let supabaseLoadToken = 0; // 진행 중인 Supabase 로드 취소용 토큰
+let isDbImportInProgress = false; // DB 일괄 덮어쓰기 중 realtime/서버로드 차단
 
 // DOM 요소 캐싱
 const fileInput = document.getElementById("fileInput");
@@ -297,9 +298,12 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   renderActiveSheet(defaultSheet);
 
   if (isOnline) {
-    if (confirm("실시간 동기화(Supabase)가 활성화되어 있습니다. 업로드한 엑셀 파일 데이터로 데이터베이스를 덮어쓰시겠습니까?")) {
-      importWorkbookToSupabase();
-    }
+    // 렌더링 완료 후 DB 덮어쓰기 확인 (확인창이 UI 갱신을 막지 않도록 분리)
+    setTimeout(() => {
+      if (confirm("실시간 동기화(Supabase)가 활성화되어 있습니다. 업로드한 엑셀 파일 데이터로 데이터베이스를 덮어쓰시겠습니까?")) {
+        importWorkbookToSupabase();
+      }
+    }, 0);
   }
 }
 
@@ -1784,7 +1788,7 @@ async function loadDataFromSupabase() {
   const loadToken = ++supabaseLoadToken;
 
   try {
-    if (isUserLocalWorkbook) {
+    if (isUserLocalWorkbook || isDbImportInProgress) {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (로컬 엑셀 우선)";
       return;
     }
@@ -1800,10 +1804,10 @@ async function loadDataFromSupabase() {
     }
     if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
 
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
     
     const arrayBuffer = await response.arrayBuffer();
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
     currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array", cellStyles: true });
     
@@ -1820,7 +1824,7 @@ async function loadDataFromSupabase() {
     }
     if (rackError) throw rackError;
 
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
     // 3. Supabase에서 최신 제품 메타데이터 조회
     let dbMeta, metaError;
@@ -1835,7 +1839,7 @@ async function loadDataFromSupabase() {
     }
     if (metaError) throw metaError;
 
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook) return;
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
     // 4. 로컬 메모리 워크북 객체에 DB 데이터 반영
     applyDbDataToWorkbook(dbRacks, dbMeta);
@@ -1861,6 +1865,8 @@ async function loadDataFromSupabase() {
 
 // 데이터베이스 조회 정보를 엑셀 워크북에 매핑해 넣는 로직
 function applyDbDataToWorkbook(dbRacks, dbMeta) {
+  if (isUserLocalWorkbook || isDbImportInProgress) return;
+
   const totalSheetName = currentWorkbook.SheetNames.find(
     (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
   );
@@ -1921,6 +1927,14 @@ function applyDbDataToWorkbook(dbRacks, dbMeta) {
 
 // 엑셀 업로드 시 엑셀 데이터를 Supabase 클라우드로 일괄 가져오는 적재기
 async function importWorkbookToSupabase() {
+  if (!currentWorkbook || !supabaseClient) return;
+
+  const savedSheetName = currentSheetName;
+  isDbImportInProgress = true;
+  isUserLocalWorkbook = true;
+  supabaseLoadToken += 1;
+  pauseRealtimeSync();
+
   try {
     syncStatusEl.textContent = "🟡 DB 덮어쓰기 중...";
     
@@ -2008,21 +2022,42 @@ async function importWorkbookToSupabase() {
       }
     }
 
-    alert("로컬 엑셀 데이터가 Supabase DB에 실시간 동기화로 백업되었습니다!");
-    syncStatusEl.textContent = "🟢 실시간 동기화 중 (로컬 엑셀 우선)";
+    // 3. 업로드한 워크북/레이아웃 유지 — 서버 템플릿 재로드 없음
+    isUserLocalWorkbook = true;
+    if (savedSheetName && currentWorkbook.Sheets[savedSheetName]) {
+      sheetSelect.value = savedSheetName;
+      renderActiveSheet(savedSheetName);
+    } else {
+      renderActiveSheet(currentSheetName);
+    }
+
+    syncStatusEl.textContent = "🟢 DB 동기화 완료 (로컬 엑셀 유지)";
+    alert("로컬 엑셀 데이터가 Supabase DB에 백업되었습니다.\n화면은 업로드한 엑셀 기준으로 유지됩니다.");
   } catch (err) {
     alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
     console.error(err);
     setOfflineMode();
+  } finally {
+    isDbImportInProgress = false;
+    isUserLocalWorkbook = true;
+    // 로컬 업로드 우선 모드에서는 realtime이 서버 템플릿으로 덮어쓰지 않도록 구독하지 않음
   }
 }
 
 // 실시간 DB 변경사항 구독 등록
 let realtimeChannel = null;
-function subscribeToRealtime() {
-  if (realtimeChannel) {
+
+function pauseRealtimeSync() {
+  if (realtimeChannel && supabaseClient) {
     supabaseClient.removeChannel(realtimeChannel);
+    realtimeChannel = null;
   }
+}
+
+function subscribeToRealtime() {
+  if (!isOnline || !supabaseClient || isUserLocalWorkbook) return;
+
+  pauseRealtimeSync();
 
   realtimeChannel = supabaseClient
     .channel('public:rack_inventory')
@@ -2034,8 +2069,7 @@ function subscribeToRealtime() {
 
 // 실시간 기기 변경에 대한 수신 처리기
 function handleRealtimeRackChange(payload) {
-  // 사용자가 업로드한 엑셀(셀/루/리 등)이 우선 — DB의 구 B1/B2 시트명으로 덮어쓰지 않음
-  if (isUserLocalWorkbook) return;
+  if (isUserLocalWorkbook || isDbImportInProgress) return;
   if (!currentWorkbook) return;
 
   const { eventType, new: newRow, old: oldRow } = payload;
