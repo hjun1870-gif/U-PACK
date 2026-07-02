@@ -269,7 +269,7 @@ header {
 /* 메인 격자 보드 컨테이너 */
 .grid-board {
   display: grid;
-  grid-template-columns: 40px repeat(9, 1fr) 50px repeat(9, 1fr) 40px;
+  /* grid-template-columns는 업로드된 엑셀 파일의 실제 열 개수에 맞추어 app.js에서 동적으로 인라인 스타일로 설정됩니다. */
   grid-auto-rows: 60px; /* 높이 고정으로 콤팩트하고 미려하게 만듬 */
   gap: 4px;
   width: 100%;
@@ -291,7 +291,7 @@ header {
 
 /* 중앙 통로 스타일 */
 .aisle-cell {
-  grid-column: 11 / 12; /* 9열 다음 통로 */
+  /* grid-column은 업로드된 엑셀 파일의 열 개수에 맞추어 중앙 분할 위치에 맞게 app.js에서 동적으로 설정됩니다. */
   display: flex;
   justify-content: center;
   align-items: center;
@@ -448,7 +448,7 @@ header {
 /* 하단 대칭형 인덱스 라벨 바 */
 .col-indices-footer {
   display: grid;
-  grid-template-columns: 40px repeat(9, 1fr) 50px repeat(9, 1fr) 40px;
+  /* grid-template-columns는 app.js에서 동적으로 인라인 처리되므로 이곳의 하드코딩 설정을 제거합니다. */
   width: 100%;
   max-width: 1400px;
   margin-top: 0.5rem;

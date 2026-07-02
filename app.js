@@ -253,12 +253,6 @@ function createMockSheet(sheetName) {
     setMockStock(sheet, 13, 18, "원일500", 5, 0);
     // 14행 18열: K500, P:7, B:17
     setMockStock(sheet, 14, 18, "K500", 7, 17);
-    // 15행 18열: SM300, P:10, B:17
-    setMockStock(sheet, 15, 18, "SM300", 10, 17);
-    // 16행 18열: 새콤초300, P:18
-    setMockStock(sheet, 16, 18, "새콤초300", 18, 0);
-    // 18행 18열: M800(신), P:10, B:5
-    setMockStock(sheet, 18, 18, "M800(신)", 10, 5);
   } else if (sheetName === "B1") {
     // B1 시트용 샘플 데이터 몇 개 추가
     setMockStock(sheet, 1, 1, "샘플제품A", 15, 3);
@@ -302,6 +296,75 @@ function updateSheetDropdown(sheetNames) {
 }
 
 /**
+ * 엑셀 시트에서 유효한 최대 열 번호(가장 큰 숫자)를 동적으로 감지합니다.
+ * @param {Object} sheet - SheetJS 시트 객체
+ * @returns {number} 최대 열 번호 (감지 실패 시 기본값 18)
+ */
+function detectMaxCols(sheet) {
+  if (!sheet || !sheet["!ref"]) return 18;
+
+  try {
+    const range = XLSX.utils.decode_range(sheet["!ref"]);
+    const row4Idx = 4; // 5번째 행 (0-based index)
+    let maxColVal = 18; // 기본 디폴트값은 18
+
+    // 5번째 행의 각 열 셀을 검색하여 숫자로 변환이 가능한 양의 정수 중 최대값을 결정
+    for (let colIdx = range.s.c; colIdx <= range.e.c; colIdx++) {
+      const cellAddress = XLSX.utils.encode_cell({ r: row4Idx, c: colIdx });
+      const cell = sheet[cellAddress];
+      if (cell && cell.v !== undefined) {
+        const numVal = parseInt(cell.v, 10);
+        if (!isNaN(numVal) && numVal > 0) {
+          if (numVal > maxColVal) {
+            maxColVal = numVal;
+          }
+        }
+      }
+    }
+    return maxColVal;
+  } catch (e) {
+    console.error("최대 열 수 감지 오류:", e);
+    return 18;
+  }
+}
+
+/**
+ * 엑셀 시트에서 유효한 최대 행 번호(가장 큰 숫자)를 A열에서 동적으로 감지합니다.
+ * @param {Object} sheet - SheetJS 시트 객체
+ * @returns {number} 최대 행 번호 (감지 실패 시 기본값 18)
+ */
+function detectMaxRows(sheet) {
+  if (!sheet || !sheet["!ref"]) return 18;
+
+  try {
+    const range = XLSX.utils.decode_range(sheet["!ref"]);
+    let maxRowVal = 18; // 기본 디폴트값은 18
+
+    // A열(col index 0)을 8번째 행(row index 7)부터 시작하여 2행 간격으로 아래로 스캔
+    // 제품 정보와 수량 정보가 2개 행을 한 세트로 차지하므로 2행 간격임
+    for (let r = 1; ; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      if (prodRowIdx > range.e.r) break;
+
+      const cellAddress = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
+      const cell = sheet[cellAddress];
+      if (cell && cell.v !== undefined) {
+        const numVal = parseInt(cell.v, 10);
+        if (!isNaN(numVal) && numVal > 0) {
+          if (numVal > maxRowVal) {
+            maxRowVal = numVal;
+          }
+        }
+      }
+    }
+    return maxRowVal;
+  } catch (e) {
+    console.error("최대 행 수 감지 오류:", e);
+    return 18;
+  }
+}
+
+/**
  * 3. 선택한 시트의 레이아웃 렌더링 및 매핑 알고리즘
  */
 function renderActiveSheet(sheetName) {
@@ -313,24 +376,33 @@ function renderActiveSheet(sheetName) {
   gridBoard.innerHTML = "";
   searchInput.value = "";
 
-  // 18행 x 18열 격자판 뼈대 생성
-  // CSS Grid 구조: [행라벨] [1~9열] [중앙통로] [10~18열] [행라벨]
-  // 18열 헤더(가로축) 상단 인덱스 렌더링
-  renderGridHeaders();
+  // 엑셀 데이터로부터 최대 행과 열의 크기를 동적으로 분석
+  const maxCols = detectMaxCols(sheet);
+  const maxRows = detectMaxRows(sheet);
 
-  // 엑셀 시트 4번째 행(인덱스 4)에서 1~18번 열 번호가 실제로 몇 번째 컬럼(Col)에 매핑되는지 동적으로 검출합니다.
-  // 시트별 템플릿 차이(예: B1, B2 열 차이)에 유연하게 대응하기 위함입니다.
-  const colMapping = detectColumnMapping(sheet);
+  // 그리드의 좌/우 영역 크기 비율 배분 (중앙에 통로를 두고 좌/우 정렬)
+  const leftCols = Math.ceil(maxCols / 2);
+  const rightCols = maxCols - leftCols;
+
+  // CSS Grid의 컬럼 분할을 JavaScript에서 인라인 스타일로 동적 정의
+  // 구성: [왼쪽 행 번호: 40px] [좌측 열들: 1fr씩] [중앙통로: 50px] [우측 열들: 1fr씩] [오른쪽 행 번호: 40px]
+  gridBoard.style.gridTemplateColumns = `40px repeat(${leftCols}, 1fr) 50px repeat(${rightCols}, 1fr) 40px`;
+
+  // 상단 열 번호 가로축 인덱스 렌더링
+  renderGridHeaders(leftCols, rightCols);
+
+  // 엑셀 시트 5번째 행(인덱스 4)에서 실제 열 번호가 매핑되는 컬럼 인덱스 맵 생성
+  const colMapping = detectColumnMapping(sheet, maxCols);
 
   let totalProducts = 0;
   let totalPallets = 0;
   let totalBoxes = 0;
 
-  // 1행부터 18행까지 루프 돌며 물리적 랙 셀 생성
-  for (let r = 1; r <= 18; r++) {
-    // 0-based 엑셀 행 인덱스 계산
-    const prodRowIdx = 7 + 2 * (r - 1); // 제품명이 들어가는 행 (8번째 행)
-    const qtyRowIdx = 8 + 2 * (r - 1);  // 수량이 들어가는 행 (9번째 행)
+  // 감지된 최대 행 수(maxRows)만큼 돌며 물리적 랙 셀들을 순서대로 배치
+  for (let r = 1; r <= maxRows; r++) {
+    // 0-based 엑셀 행 인덱스 계산 (제품 행은 index 7부터 2씩, 수량 행은 index 8부터 2씩 증가)
+    const prodRowIdx = 7 + 2 * (r - 1);
+    const qtyRowIdx = 8 + 2 * (r - 1);
 
     // 왼쪽 행 번호 라벨 생성
     const leftRowLabel = document.createElement("div");
@@ -338,8 +410,8 @@ function renderActiveSheet(sheetName) {
     leftRowLabel.textContent = r;
     gridBoard.appendChild(leftRowLabel);
 
-    // 1~9열 (좌측 영역) 렌더링
-    for (let c = 1; c <= 9; c++) {
+    // 1 ~ leftCols 열 (좌측 영역 랙) 렌더링
+    for (let c = 1; c <= leftCols; c++) {
       const cellData = getRackCellData(sheet, colMapping, r, c, prodRowIdx, qtyRowIdx);
       const cellEl = createRackCellElement(r, c, cellData);
       gridBoard.appendChild(cellEl);
@@ -351,14 +423,18 @@ function renderActiveSheet(sheetName) {
       }
     }
 
-    // 중앙 통로 셀 생성 (11번째 컬럼)
+    // 중앙 통로 셀 생성 (그리드에서의 배치 인덱스는 leftCols + 2번째 컬럼)
     const aisle = document.createElement("div");
-    if (r === 18) {
-      // 18행에는 입구 게이트와 화살표 렌더링
+    
+    // 중앙 통로의 Grid Column 위치를 동적으로 설정
+    const aisleColIdx = leftCols + 2;
+    aisle.style.gridColumn = `${aisleColIdx} / ${aisleColIdx + 1}`;
+
+    if (r === maxRows) {
+      // 맨 마지막 행의 통로에는 화살표와 "입구" 가이드 렌더링
       aisle.className = "aisle-cell entrance-gate";
       const arrow = document.createElement("div");
       arrow.className = "entrance-arrow";
-      // SVG 위쪽 화살표와 "B2 입구" 텍스트
       arrow.innerHTML = `
         <svg viewBox="0 0 24 24">
           <path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/>
@@ -371,8 +447,8 @@ function renderActiveSheet(sheetName) {
     }
     gridBoard.appendChild(aisle);
 
-    // 10~18열 (우측 영역) 렌더링
-    for (let c = 10; c <= 18; c++) {
+    // leftCols + 1 ~ maxCols 열 (우측 영역 랙) 렌더링
+    for (let c = leftCols + 1; c <= maxCols; c++) {
       const cellData = getRackCellData(sheet, colMapping, r, c, prodRowIdx, qtyRowIdx);
       const cellEl = createRackCellElement(r, c, cellData);
       gridBoard.appendChild(cellEl);
@@ -392,7 +468,7 @@ function renderActiveSheet(sheetName) {
   }
 
   // 하단 헤더(가로축 대칭형 인덱스) 렌더링
-  renderGridFooters();
+  renderGridFooters(leftCols, rightCols);
 
   // 통계 요약판 수치 반영
   totalProductsEl.textContent = totalProducts;
@@ -401,25 +477,26 @@ function renderActiveSheet(sheetName) {
 }
 
 /**
- * 엑셀 시트의 4행에서 1~18번 열 번호가 기록된 컬럼 인덱스를 동적으로 찾아 매핑 맵(Map)을 반환합니다.
+ * 엑셀 시트의 4행에서 열 번호(1~maxCols)가 기록된 컬럼 인덱스를 동적으로 찾아 매핑 맵(Map)을 반환합니다.
  */
-function detectColumnMapping(sheet) {
+function detectColumnMapping(sheet, maxCols) {
   const mapping = {};
-  // 시트가 유효하지 않으면 기본 매핑 생성
-  if (!sheet) return createDefaultMapping();
+  const currentMaxCols = maxCols || 18;
 
-  // A1 형태로 전체 범위를 파싱하여 행과 열의 범위를 계산
-  const range = XLSX.utils.decode_range(sheet["!ref"] || "A1:AM44");
+  // 시트가 유효하지 않으면 기본 매핑 생성
+  if (!sheet) return createDefaultMapping(currentMaxCols);
+
+  const range = XLSX.utils.decode_range(sheet["!ref"] || `A1:AM${7 + 2 * currentMaxCols}`);
   const row4Idx = 4; // 5번째 행 (0-based 4)
 
-  // 0열부터 최대 열 범위까지 검사하여 1~18 숫자가 적힌 곳을 찾음
+  // 0열부터 최대 열 범위까지 검사하여 열 번호 숫자가 적힌 곳을 매핑
   for (let colIdx = range.s.c; colIdx <= range.e.c; colIdx++) {
     const cellAddress = XLSX.utils.encode_cell({ r: row4Idx, c: colIdx });
     const cell = sheet[cellAddress];
     if (cell && cell.v !== undefined) {
       const numVal = parseInt(cell.v, 10);
-      if (numVal >= 1 && numVal <= 18) {
-        // 이미 맵에 존재하지 않는 경우에만 설정 (B1, B2 시트의 병합 셀 등으로 동일 숫자가 인접해 나오는 것 처리)
+      if (numVal >= 1 && numVal <= currentMaxCols) {
+        // 이미 맵에 존재하지 않는 경우에만 설정 (셀 병합 인접 중복 오류 방지)
         if (mapping[numVal] === undefined) {
           mapping[numVal] = colIdx;
         }
@@ -428,9 +505,10 @@ function detectColumnMapping(sheet) {
   }
 
   // 누락된 열 번호가 있다면 기본 매핑을 보완책으로 사용
-  for (let c = 1; c <= 18; c++) {
+  const leftCols = Math.ceil(currentMaxCols / 2);
+  for (let c = 1; c <= currentMaxCols; c++) {
     if (mapping[c] === undefined) {
-      if (c <= 9) {
+      if (c <= leftCols) {
         mapping[c] = 2 * c - 1;
       } else {
         mapping[c] = 2 * c + 1;
@@ -441,10 +519,12 @@ function detectColumnMapping(sheet) {
   return mapping;
 }
 
-function createDefaultMapping() {
+function createDefaultMapping(maxCols) {
   const mapping = {};
-  for (let c = 1; c <= 18; c++) {
-    mapping[c] = c <= 9 ? 2 * c - 1 : 2 * c + 1;
+  const currentMaxCols = maxCols || 18;
+  const leftCols = Math.ceil(currentMaxCols / 2);
+  for (let c = 1; c <= currentMaxCols; c++) {
+    mapping[c] = c <= leftCols ? 2 * c - 1 : 2 * c + 1;
   }
   return mapping;
 }
@@ -466,6 +546,8 @@ function getRackCellData(sheet, colMapping, row, col, prodRowIdx, qtyRowIdx) {
 
   // 파레트(P)가 저장되는 컬럼 인덱스
   const pColIdx = colMapping[col];
+  if (pColIdx === undefined) return data;
+
   // 박스(B)가 저장되는 컬럼은 항상 P의 바로 우측 컬럼
   const bColIdx = pColIdx + 1;
 
@@ -641,16 +723,20 @@ function handleSearch(e) {
     const sheet = currentWorkbook.Sheets[sheetName];
     if (!sheet) return;
 
-    // 해당 시트의 열 좌표 매핑 정보 검출
-    const colMapping = detectColumnMapping(sheet);
+    // 해당 시트의 실제 최대 행과 열 동적 감지
+    const maxCols = detectMaxCols(sheet);
+    const maxRows = detectMaxRows(sheet);
 
-    // 1행부터 18행까지 순회
-    for (let r = 1; r <= 18; r++) {
+    // 해당 시트의 열 좌표 매핑 정보 검출 (동적 maxCols 전달)
+    const colMapping = detectColumnMapping(sheet, maxCols);
+
+    // 1행부터 maxRows행까지 순회
+    for (let r = 1; r <= maxRows; r++) {
       const prodRowIdx = 7 + 2 * (r - 1);
       const qtyRowIdx = 8 + 2 * (r - 1);
 
-      // 1열부터 18열까지 순회
-      for (let c = 1; c <= 18; c++) {
+      // 1열부터 maxCols열까지 순회
+      for (let c = 1; c <= maxCols; c++) {
         const pColIdx = colMapping[c];
         if (pColIdx === undefined) continue;
         const bColIdx = pColIdx + 1;
