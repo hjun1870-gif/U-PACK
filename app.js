@@ -32,6 +32,7 @@ const emptyGuide = document.getElementById("emptyGuide");
 const totalProductsEl = document.getElementById("totalProducts");
 const totalPalletsEl = document.getElementById("totalPallets");
 const totalBoxesEl = document.getElementById("totalBoxes");
+const layoutInfoEl = document.getElementById("layoutInfo");
 
 // 모달 관련 요소
 const editModal = document.getElementById("editModal");
@@ -90,46 +91,212 @@ document.addEventListener("click", (e) => {
   }
 });
 
-/**
- * 2. 엑셀 파일 로드 및 파싱 처리
- */
-function handleFileSelect(e) {
-  const file = e.target.files[0];
+// 엑셀 드래그 앤 드롭 업로드
+document.body.addEventListener("dragover", (e) => {
+  e.preventDefault();
+});
+document.body.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer?.files?.[0];
   if (!file) return;
+  if (!/\.xlsx?$/.test(file.name)) {
+    alert("엑셀 파일(.xlsx, .xls)만 업로드할 수 있습니다.");
+    return;
+  }
+  loadWorkbookFromFile(file);
+});
 
+/**
+ * 합계/집계 시트 여부 판별
+ */
+function isSummarySheetName(sheetName) {
+  const upper = String(sheetName).toUpperCase();
+  return upper === "TOTAL" || sheetName.includes("합계");
+}
+
+/**
+ * 시트에 창고 도면(랙 격자) 구조가 있는지 판별
+ */
+function hasWarehouseLayout(sheet) {
+  if (!sheet || !sheet["!ref"]) return false;
+
+  const { leftRacks, rightRacks } = detectRacks(sheet, { allowDefault: false });
+  const totalRacks = leftRacks.length + rightRacks.length;
+  const maxRows = detectMaxRows(sheet);
+
+  if (totalRacks < 4 || maxRows < 4) return false;
+
+  // '제품' / 'P' 헤더 행이 있어야 재고조사표 도면으로 인정
+  let hasProductHeader = false;
+  let hasPbHeader = false;
+
+  try {
+    const range = XLSX.utils.decode_range(sheet["!ref"]);
+    for (let r = 4; r <= 6; r++) {
+      for (let c = range.s.c; c <= Math.min(range.e.c, 40); c++) {
+        const val = sheet[XLSX.utils.encode_cell({ r, c })]?.v;
+        if (val === undefined) continue;
+        const text = String(val).trim();
+        if (text.includes("제품")) hasProductHeader = true;
+        if (text === "P") hasPbHeader = true;
+      }
+    }
+  } catch (e) {
+    return false;
+  }
+
+  return hasProductHeader && hasPbHeader;
+}
+
+/**
+ * 업로드된 워크북에서 창고 도면 시트 목록만 추출
+ */
+function getWarehouseSheetNames(workbook) {
+  if (!workbook) return [];
+  return workbook.SheetNames.filter((name) => {
+    if (isSummarySheetName(name)) return false;
+    return hasWarehouseLayout(workbook.Sheets[name]);
+  });
+}
+
+/**
+ * 창고 시트의 표시용 제목 파싱 (예: "<재고조사표 - B1>" → "B1")
+ */
+function parseSheetDisplayTitle(sheet, sheetName) {
+  if (!sheet || !sheet["!ref"]) return sheetName;
+
+  try {
+    const range = XLSX.utils.decode_range(sheet["!ref"]);
+    for (let r = range.s.r; r <= Math.min(range.e.r, 6); r++) {
+      for (let c = range.s.c; c <= Math.min(range.e.c, 10); c++) {
+        const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+        if (!cell || cell.v === undefined) continue;
+        const text = String(cell.v).trim();
+        const match = text.match(/<재고조사표\s*-\s*([^>]+)>/);
+        if (match) return match[1].trim();
+      }
+    }
+  } catch (e) {
+    console.warn("시트 제목 파싱 실패:", e);
+  }
+  return sheetName;
+}
+
+/**
+ * 업로드 후 기본으로 열 창고 시트 결정
+ */
+function resolveDefaultSheetName(workbook, preferredName) {
+  const warehouseSheets = getWarehouseSheetNames(workbook);
+  if (warehouseSheets.length === 0) return workbook.SheetNames[0] || "";
+
+  if (preferredName && warehouseSheets.includes(preferredName)) {
+    return preferredName;
+  }
+  if (warehouseSheets.includes("B2")) return "B2";
+  if (warehouseSheets.includes("B1")) return "B1";
+  return warehouseSheets[0];
+}
+
+/**
+ * 엑셀 셀 배경색(RGB) 추출 — xlsx-js-style 서식 기반
+ */
+function getCellFillRgb(sheet, rowIdx, colIdx) {
+  const cell = sheet?.[XLSX.utils.encode_cell({ r: rowIdx, c: colIdx })];
+  const rgb = cell?.s?.fill?.fgColor?.rgb || cell?.s?.fgColor?.rgb;
+  return rgb ? String(rgb).replace(/^FF/i, "").toUpperCase() : "";
+}
+
+/**
+ * 엑셀 배경색 → 대시보드 구역(zone) CSS 클래스
+ */
+function resolveZoneClass(sheet, prodRowIdx, pColIdx) {
+  const rgb = getCellFillRgb(sheet, prodRowIdx, pColIdx);
+  if (!rgb) return "";
+
+  // 연파랑 계열 (B1 상단 4행 등)
+  if (["9DC3E6", "BDD7EE", "DEEAF6", "B4C6E7"].includes(rgb)) {
+    return "zone-blue";
+  }
+  // 연초록 계열
+  if (["C5E0B4", "E2EFDA", "A9D08E", "C6E0B4"].includes(rgb)) {
+    return "zone-green";
+  }
+
+  // 테마 기반 색상 대략적 분류
+  const theme = cellThemeHint(sheet, prodRowIdx, pColIdx);
+  if (theme === "blue") return "zone-blue";
+  if (theme === "green") return "zone-green";
+  return "";
+}
+
+function cellThemeHint(sheet, rowIdx, colIdx) {
+  const cell = sheet?.[XLSX.utils.encode_cell({ r: rowIdx, c: colIdx })];
+  const theme = cell?.s?.fill?.fgColor?.theme;
+  const tint = cell?.s?.fill?.fgColor?.tint ?? 0;
+  if (theme === 4 || (theme === 5 && tint > 0)) return "blue";
+  if (theme === 9 || theme === 10) return "green";
+  return "";
+}
+
+/**
+ * File/Blob 객체에서 워크북을 읽어 UI에 반영
+ */
+function loadWorkbookFromFile(file) {
   const reader = new FileReader();
   reader.onload = function (e) {
     const data = new Uint8Array(e.target.result);
     try {
-      // SheetJS로 바이너리 데이터 로드
-      const workbook = XLSX.read(data, { type: "array" });
-      currentWorkbook = workbook;
-      
-      // 시트 선택 드롭다운 갱신
-      updateSheetDropdown(workbook.SheetNames);
-      
-      // 가이드 숨기고 그리드 표시 영역 세팅
-      emptyGuide.style.display = "none";
-      gridBoard.style.display = "grid";
-      exportBtn.style.display = "inline-block";
-      
-      // 기본적으로 'B2' 시트를 렌더링하고, 없으면 첫 번째 시트 렌더링
-      const defaultSheet = workbook.SheetNames.includes("B2") ? "B2" : workbook.SheetNames[0];
-      sheetSelect.value = defaultSheet;
-      renderActiveSheet(defaultSheet);
-
-      // --- 추가: Supabase 데이터베이스 적재 여부 확인 ---
-      if (isOnline) {
-        if (confirm("실시간 동기화(Supabase)가 활성화되어 있습니다. 업로드한 엑셀 파일 데이터로 데이터베이스를 덮어쓰시겠습니까?")) {
-          importWorkbookToSupabase();
-        }
-      }
+      const workbook = XLSX.read(data, { type: "array", cellStyles: true });
+      applyLoadedWorkbook(workbook);
     } catch (err) {
       alert("엑셀 파일을 파싱하는 데 실패했습니다. 파일이 손상되었거나 유효한 엑셀 형식이 아닙니다.");
       console.error(err);
     }
   };
   reader.readAsArrayBuffer(file);
+}
+
+/**
+ * 파싱된 워크북을 앱 상태에 반영하고 첫 창고 시트 렌더링
+ */
+function applyLoadedWorkbook(workbook, preferredSheetName) {
+  const previousSheet = currentSheetName;
+  currentWorkbook = workbook;
+
+  const warehouseSheets = getWarehouseSheetNames(workbook);
+  if (warehouseSheets.length === 0) {
+    alert("창고 도면 형식의 시트를 찾을 수 없습니다. 재고조사표 양식(B1, B2 등)을 확인해 주세요.");
+    return;
+  }
+
+  updateSheetDropdown(warehouseSheets);
+
+  emptyGuide.style.display = "none";
+  gridBoard.style.display = "grid";
+  exportBtn.style.display = "inline-block";
+
+  const defaultSheet = resolveDefaultSheetName(
+    workbook,
+    preferredSheetName || previousSheet
+  );
+  sheetSelect.value = defaultSheet;
+  renderActiveSheet(defaultSheet);
+
+  if (isOnline) {
+    if (confirm("실시간 동기화(Supabase)가 활성화되어 있습니다. 업로드한 엑셀 파일 데이터로 데이터베이스를 덮어쓰시겠습니까?")) {
+      importWorkbookToSupabase();
+    }
+  }
+}
+
+/**
+ * 2. 엑셀 파일 로드 및 파싱 처리
+ */
+function handleFileSelect(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  loadWorkbookFromFile(file);
+  e.target.value = "";
 }
 
 /**
@@ -148,14 +315,14 @@ function loadDemoWorkbook() {
 
   currentWorkbook = wb;
 
-  // UI 요소 갱신 및 표시 전환
-  updateSheetDropdown(wb.SheetNames);
+  updateSheetDropdown(getWarehouseSheetNames(wb));
   emptyGuide.style.display = "none";
   gridBoard.style.display = "grid";
   exportBtn.style.display = "inline-block";
 
-  sheetSelect.value = "B2";
-  renderActiveSheet("B2");
+  const defaultSheet = resolveDefaultSheetName(wb);
+  sheetSelect.value = defaultSheet;
+  renderActiveSheet(defaultSheet);
 }
 
 /**
@@ -290,9 +457,103 @@ function updateSheetDropdown(sheetNames) {
   sheetNames.forEach((name) => {
     const option = document.createElement("option");
     option.value = name;
-    option.textContent = name;
+    const sheet = currentWorkbook?.Sheets?.[name];
+    const displayTitle = sheet ? parseSheetDisplayTitle(sheet, name) : name;
+    option.textContent = displayTitle === name ? name : `${name} (${displayTitle})`;
     sheetSelect.appendChild(option);
   });
+}
+
+/**
+ * 랙 목록을 좌/우 영역으로 분할
+ */
+function splitRacksByAisle(allRacks) {
+  const leftRacks = [];
+  const rightRacks = [];
+
+  if (allRacks.length === 0) {
+    return { leftRacks, rightRacks };
+  }
+
+  let splitIndex = 0;
+  let maxGap = 0;
+
+  for (let i = 0; i < allRacks.length - 1; i++) {
+    const gap = allRacks[i + 1].colIdx - allRacks[i].colIdx;
+    if (gap > maxGap) {
+      maxGap = gap;
+      splitIndex = i;
+    }
+  }
+
+  if (maxGap <= 2) {
+    splitIndex = Math.floor(allRacks.length / 2) - 1;
+  }
+
+  for (let i = 0; i <= splitIndex; i++) {
+    leftRacks.push(allRacks[i]);
+  }
+  for (let i = splitIndex + 1; i < allRacks.length; i++) {
+    rightRacks.push(allRacks[i]);
+  }
+
+  return { leftRacks, rightRacks };
+}
+
+/**
+ * 5행(열 번호)이 없을 때 6행 '제품' 헤더로 랙 열 자동 감지
+ */
+function detectRacksFromProductHeaders(sheet, range) {
+  const productRowIdx = 5; // 엑셀 6행
+  const allRacks = [];
+  let lastColIdx = -10;
+
+  for (let colIdx = range.s.c; colIdx <= range.e.c; colIdx++) {
+    const cell = sheet[XLSX.utils.encode_cell({ r: productRowIdx, c: colIdx })];
+    const text = cell?.v !== undefined ? String(cell.v).trim() : "";
+    if (!text.includes("제품")) continue;
+
+    const pCell = sheet[XLSX.utils.encode_cell({ r: productRowIdx + 1, c: colIdx })];
+    const pText = pCell?.v !== undefined ? String(pCell.v).trim() : "";
+    if (pText !== "P") continue;
+
+    if (colIdx - lastColIdx >= 2) {
+      allRacks.push({ rackNo: 0, colIdx });
+      lastColIdx = colIdx;
+    }
+  }
+
+  if (allRacks.length === 0) {
+    return { leftRacks: [], rightRacks: [] };
+  }
+
+  const { leftRacks, rightRacks } = splitRacksByAisle(allRacks);
+  const rightCount = rightRacks.length;
+
+  leftRacks.forEach((rack, idx) => {
+    rack.rackNo = idx + 1;
+  });
+  rightRacks.forEach((rack, idx) => {
+    rack.rackNo = rightCount > 0 ? rightCount - idx : leftRacks.length + idx + 1;
+  });
+
+  return { leftRacks, rightRacks };
+}
+
+/**
+ * 데모/기본 레이아웃 (18열 대칭)
+ */
+function createDefaultRackLayout() {
+  const leftRacks = [];
+  const rightRacks = [];
+  for (let c = 1; c <= 9; c++) {
+    leftRacks.push({ rackNo: c, colIdx: 2 * c - 1 });
+  }
+  for (let i = 0; i < 9; i++) {
+    const c = 10 + i;
+    rightRacks.push({ rackNo: 9 - i, colIdx: 2 * c + 1 });
+  }
+  return { leftRacks, rightRacks };
 }
 
 /**
@@ -300,78 +561,45 @@ function updateSheetDropdown(sheetNames) {
  * @param {Object} sheet - SheetJS 시트 객체
  * @returns {Object} { leftRacks, rightRacks }
  */
-function detectRacks(sheet) {
-  const leftRacks = [];
-  const rightRacks = [];
-  
-  // 기본 모형 데이터를 위한 디폴트 세팅 (좌 9개, 우 9개)
+function detectRacks(sheet, options = {}) {
+  const allowDefault = options.allowDefault !== false;
+
   if (!sheet || !sheet["!ref"]) {
-    for (let c = 1; c <= 9; c++) {
-      leftRacks.push({ rackNo: c, colIdx: 2 * c - 1 });
-    }
-    for (let c = 10; c <= 18; c++) {
-      rightRacks.push({ rackNo: c, colIdx: c <= 9 ? 2 * c - 1 : 2 * c + 1 });
-    }
-    return { leftRacks, rightRacks };
+    return allowDefault ? createDefaultRackLayout() : { leftRacks: [], rightRacks: [] };
   }
 
   try {
     const range = XLSX.utils.decode_range(sheet["!ref"]);
-    const row4Idx = 4; // 5번째 행 (0-based 4)
+    const row4Idx = 4; // 엑셀 5행: 열(랙) 번호
     const allRacks = [];
     let lastColIdx = -10;
 
-    // 5번째 행을 돌며 열 번호(랙 번호) 스캔
     for (let colIdx = range.s.c; colIdx <= range.e.c; colIdx++) {
       const cellAddress = XLSX.utils.encode_cell({ r: row4Idx, c: colIdx });
       const cell = sheet[cellAddress];
       if (cell && cell.v !== undefined) {
         const numVal = parseInt(cell.v, 10);
-        if (!isNaN(numVal) && numVal > 0) {
-          // 셀 병합 및 P/B 분할 열로 인한 인접 중복 컬럼 필터링 (최소 2열 간격 유지)
+        if (!isNaN(numVal) && numVal > 0 && numVal <= 99) {
           if (colIdx - lastColIdx >= 2) {
-            allRacks.push({ rackNo: numVal, colIdx: colIdx });
+            allRacks.push({ rackNo: numVal, colIdx });
             lastColIdx = colIdx;
           }
         }
       }
     }
 
-    // 랙 정보가 없다면 기본값 리턴
     if (allRacks.length === 0) {
-      return detectRacks(null);
-    }
-
-    // 좌측과 우측의 경계선(중앙 통로) 검출
-    // 인접한 두 랙의 엑셀 열 인덱스 차이가 가장 큰 곳을 통로로 삼음
-    let splitIndex = 0;
-    let maxGap = 0;
-
-    for (let i = 0; i < allRacks.length - 1; i++) {
-      const gap = allRacks[i+1].colIdx - allRacks[i].colIdx;
-      if (gap > maxGap) {
-        maxGap = gap;
-        splitIndex = i;
+      const fromHeaders = detectRacksFromProductHeaders(sheet, range);
+      if (fromHeaders.leftRacks.length + fromHeaders.rightRacks.length > 0) {
+        return fromHeaders;
       }
+      return allowDefault ? createDefaultRackLayout() : { leftRacks: [], rightRacks: [] };
     }
 
-    // 갭 차이가 거의 없다면 절반 분할
-    if (maxGap <= 2) {
-      splitIndex = Math.floor(allRacks.length / 2) - 1;
-    }
-
-    // 좌측 및 우측 랙 리스트 배분
-    for (let i = 0; i <= splitIndex; i++) {
-      leftRacks.push(allRacks[i]);
-    }
-    for (let i = splitIndex + 1; i < allRacks.length; i++) {
-      rightRacks.push(allRacks[i]);
-    }
-
-    return { leftRacks, rightRacks };
+    return splitRacksByAisle(allRacks);
   } catch (e) {
     console.error("랙 배치 구조 분석 오류:", e);
-    return detectRacks(null);
+    return allowDefault ? createDefaultRackLayout() : { leftRacks: [], rightRacks: [] };
   }
 }
 
@@ -395,10 +623,9 @@ function detectMaxRows(sheet) {
 
   try {
     const range = XLSX.utils.decode_range(sheet["!ref"]);
-    let maxRowVal = 18; // 기본 디폴트값은 18
+    let maxRowVal = 0;
+    let consecutiveMisses = 0;
 
-    // A열(col index 0)을 8번째 행(row index 7)부터 시작하여 2행 간격으로 아래로 스캔
-    // 제품 정보와 수량 정보가 2개 행을 한 세트로 차지하므로 2행 간격임
     for (let r = 1; ; r++) {
       const prodRowIdx = 7 + 2 * (r - 1);
       if (prodRowIdx > range.e.r) break;
@@ -408,13 +635,17 @@ function detectMaxRows(sheet) {
       if (cell && cell.v !== undefined) {
         const numVal = parseInt(cell.v, 10);
         if (!isNaN(numVal) && numVal > 0) {
-          if (numVal > maxRowVal) {
-            maxRowVal = numVal;
-          }
+          maxRowVal = Math.max(maxRowVal, numVal);
+          consecutiveMisses = 0;
+          continue;
         }
       }
+
+      consecutiveMisses++;
+      if (maxRowVal > 0 && consecutiveMisses >= 3) break;
     }
-    return maxRowVal;
+
+    return maxRowVal || 18;
   } catch (e) {
     console.error("최대 행 수 감지 오류:", e);
     return 18;
@@ -439,9 +670,16 @@ function renderActiveSheet(sheetName) {
   const leftCols = leftRacks.length;
   const rightCols = rightRacks.length;
   const maxRows = detectMaxRows(sheet);
+  const displayTitle = parseSheetDisplayTitle(sheet, sheetName);
+  const totalCols = leftCols + rightCols;
 
-  // CSS Grid의 컬럼 구조 동적 인라인 설정
-  gridBoard.style.gridTemplateColumns = `40px repeat(${leftCols}, 1fr) 50px repeat(${rightCols}, 1fr) 40px`;
+  // CSS Grid 컬럼·행 — 업로드된 시트의 실제 랙/행 수에 맞춰 동적 구성
+  gridBoard.style.gridTemplateColumns = `40px repeat(${leftCols}, minmax(52px, 1fr)) 50px repeat(${rightCols}, minmax(52px, 1fr)) 40px`;
+  gridBoard.style.maxWidth = totalCols <= 14 ? "1100px" : totalCols <= 16 ? "1250px" : "1400px";
+  gridBoard.dataset.sheetName = sheetName;
+  gridBoard.dataset.layout = `${leftCols}+${rightCols}x${maxRows}`;
+
+  layoutInfoEl.textContent = `${displayTitle} · 좌${leftCols} / 우${rightCols}열 × ${maxRows}행`;
 
   // 상단 축 랙 번호 인덱스 라벨 렌더링
   renderGridHeaders(leftRacks, rightRacks);
@@ -469,7 +707,8 @@ function renderActiveSheet(sheetName) {
     leftRacks.forEach((rackInfo, idx) => {
       const colSeq = idx + 1; // 1-based 물리적 순번
       const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
-      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo);
+      const zoneClass = resolveZoneClass(sheet, prodRowIdx, rackInfo.colIdx);
+      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass);
       gridBoard.appendChild(cellEl);
 
       if (cellData.product) {
@@ -492,7 +731,7 @@ function renderActiveSheet(sheetName) {
         <svg viewBox="0 0 24 24">
           <path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/>
         </svg>
-        <span>입구</span>
+        <span>${displayTitle}</span>
       `;
       aisle.appendChild(arrow);
     } else {
@@ -504,7 +743,8 @@ function renderActiveSheet(sheetName) {
     rightRacks.forEach((rackInfo, idx) => {
       const colSeq = leftCols + idx + 1; // 1-based 물리적 순번
       const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
-      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo);
+      const zoneClass = resolveZoneClass(sheet, prodRowIdx, rackInfo.colIdx);
+      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass);
       gridBoard.appendChild(cellEl);
 
       if (cellData.product) {
@@ -600,13 +840,14 @@ function getRackCellData(sheet, colMapping, row, col, prodRowIdx, qtyRowIdx) {
 /**
  * 랙 셀 DOM 엘리먼트 생성
  */
-function createRackCellElement(row, col, cellData, rackNo) {
+function createRackCellElement(row, col, cellData, rackNo, zoneClass = "") {
   const cell = document.createElement("div");
+  const classes = ["rack-cell"];
   if (cellData.product || cellData.pallet > 0 || cellData.box > 0) {
-    cell.className = "rack-cell active-stock";
-  } else {
-    cell.className = "rack-cell";
+    classes.push("active-stock");
   }
+  if (zoneClass) classes.push(zoneClass);
+  cell.className = classes.join(" ");
 
   // 검색 시 필터링을 쉽게 하기 위해 제품명을 data 속성으로 주입
   cell.dataset.product = cellData.product.toLowerCase();
@@ -739,8 +980,9 @@ function handleSearch(e) {
     return;
   }
 
-  // 3. 전체 시트(구역)를 순회하며 일치하는 재고 데이터 및 수량(P, B) 수집 (글로벌 스캔)
-  currentWorkbook.SheetNames.forEach((sheetName) => {
+  // 3. 전체 창고 시트(구역)를 순회하며 일치하는 재고 데이터 및 수량(P, B) 수집
+  const warehouseSheets = getWarehouseSheetNames(currentWorkbook);
+  warehouseSheets.forEach((sheetName) => {
     const sheet = currentWorkbook.Sheets[sheetName];
     if (!sheet) return;
 
@@ -1055,7 +1297,8 @@ function aggregateTotalSheet(workbook) {
   const aggregated = {}; // { "M300": { pallet: 합계, box: 합계 }, ... }
 
   workbook.SheetNames.forEach((sheetName) => {
-    if (sheetName === totalSheetName) return; // TOTAL 자기 자신 스킵
+    if (isSummarySheetName(sheetName)) return;
+    if (!hasWarehouseLayout(workbook.Sheets[sheetName])) return; // TOTAL 자기 자신 스킵
 
     const sheet = workbook.Sheets[sheetName];
     if (!sheet) return;
@@ -1539,7 +1782,7 @@ async function loadDataFromSupabase() {
     if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
     
     const arrayBuffer = await response.arrayBuffer();
-    currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array" });
+    currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array", cellStyles: true });
     
     // 2. Supabase에서 최신 랙 데이터 일괄 조회
     let dbRacks, rackError;
@@ -1571,12 +1814,12 @@ async function loadDataFromSupabase() {
     applyDbDataToWorkbook(dbRacks, dbMeta);
 
     // 5. 가이드 숨기고 그리드 표시 영역 세팅
-    updateSheetDropdown(currentWorkbook.SheetNames);
+    updateSheetDropdown(getWarehouseSheetNames(currentWorkbook));
     emptyGuide.style.display = "none";
     gridBoard.style.display = "grid";
     exportBtn.style.display = "inline-block";
 
-    const defaultSheet = currentWorkbook.SheetNames.includes("B2") ? "B2" : currentWorkbook.SheetNames[0];
+    const defaultSheet = resolveDefaultSheetName(currentWorkbook);
     sheetSelect.value = defaultSheet;
     renderActiveSheet(defaultSheet);
     
@@ -1601,8 +1844,7 @@ function applyDbDataToWorkbook(dbRacks, dbMeta) {
   });
 
   // 모든 구역 랙 셀 비우고 초기화
-  currentWorkbook.SheetNames.forEach(sheetName => {
-    if (sheetName === totalSheetName) return;
+  getWarehouseSheetNames(currentWorkbook).forEach((sheetName) => {
     const sheet = currentWorkbook.Sheets[sheetName];
     if (!sheet) return;
     const maxCols = detectMaxCols(sheet);
@@ -1695,8 +1937,7 @@ async function importWorkbookToSupabase() {
     }
 
     // 각 구역 시트에서 랙 리스트 긁기
-    currentWorkbook.SheetNames.forEach((sheetName) => {
-      if (sheetName === totalSheetName) return;
+    getWarehouseSheetNames(currentWorkbook).forEach((sheetName) => {
       const sheet = currentWorkbook.Sheets[sheetName];
       if (!sheet) return;
 

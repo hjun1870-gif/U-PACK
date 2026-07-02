@@ -360,6 +360,27 @@ header {
   border: 1px solid var(--cell-active-border);
 }
 
+/* 엑셀 도면 구역 색상 반영 (연파랑/연초록) */
+.rack-cell.zone-blue {
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.25);
+}
+
+.rack-cell.zone-blue.active-stock {
+  background: rgba(56, 189, 248, 0.22);
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.rack-cell.zone-green {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.18);
+}
+
+.rack-cell.zone-green.active-stock {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(16, 185, 129, 0.4);
+}
+
 .rack-cell.active-stock:hover {
   border-color: var(--accent-green);
   box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
