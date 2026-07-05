@@ -148,48 +148,7 @@ function hasWarehouseLayout(sheet) {
     return false;
   }
 
-  return hasProductHeader && hasPbHeader && (hasRow5RackNumbers(sheet) || sheetHasAnyStock(sheet));
-}
-
-/**
- * 5행에 숫자 랙 번호가 있는지 (B1/셀/루 형식 도면)
- */
-function hasRow5RackNumbers(sheet) {
-  if (!sheet || !sheet["!ref"]) return false;
-  try {
-    const range = XLSX.utils.decode_range(sheet["!ref"]);
-    let count = 0;
-    for (let colIdx = range.s.c; colIdx <= range.e.c; colIdx++) {
-      const cell = sheet[XLSX.utils.encode_cell({ r: 4, c: colIdx })];
-      const numVal = parseInt(cell?.v, 10);
-      if (!isNaN(numVal) && numVal > 0 && numVal <= 99) count++;
-    }
-    return count >= 4;
-  } catch (e) {
-    return false;
-  }
-}
-
-/**
- * 시트에 실제 적재된 제품이 1개 이상 있는지
- */
-function sheetHasAnyStock(sheet) {
-  const { leftRacks, rightRacks } = detectRacks(sheet, { allowDefault: false });
-  if (leftRacks.length + rightRacks.length === 0) return false;
-
-  const maxRows = detectMaxRows(sheet);
-  const colMapping = detectColumnMapping(sheet);
-  const maxCols = leftRacks.length + rightRacks.length;
-
-  for (let r = 1; r <= maxRows; r++) {
-    const prodRowIdx = 7 + 2 * (r - 1);
-    const qtyRowIdx = 8 + 2 * (r - 1);
-    for (let c = 1; c <= maxCols; c++) {
-      const cellData = getRackCellData(sheet, colMapping, r, c, prodRowIdx, qtyRowIdx);
-      if (cellData.product) return true;
-    }
-  }
-  return false;
+  return hasProductHeader && hasPbHeader && totalRacks >= 4 && maxRows >= 4;
 }
 
 /**
