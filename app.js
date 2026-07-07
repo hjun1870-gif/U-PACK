@@ -333,6 +333,10 @@ function rememberLastSheet(sheetName) {
   if (sheetName) localStorage.setItem(LAST_SHEET_KEY, sheetName);
 }
 
+function getRememberedSheet() {
+  return localStorage.getItem(LAST_SHEET_KEY) || "";
+}
+
 async function fetchInventoryRacksFromDb() {
   const { data, error } = await supabaseClient
     .from("rack_inventory")
