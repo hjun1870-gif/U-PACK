@@ -146,6 +146,24 @@ const WORKBOOK_CHUNK_SIZE = 20000;
 const SYSTEM_SHEET_NAMES = [WORKBOOK_ARCHIVE_SHEET, WORKBOOK_LAYOUT_SHEET];
 const LAST_SHEET_KEY = "last_sheet_name";
 
+/** TOTAL 시트 열 정의 (0-based) */
+const TOTAL_HEADER_ROW = 4;
+const TOTAL_DATA_START_ROW = 5;
+const TOTAL_COL = {
+  PRODUCT: 0,
+  IPSUR: 1,
+  BOX_UNIT: 2,
+  PALLET: 3,
+  BOX: 4,
+  JAN: 5,
+  STOCK: 6,
+  CHULGO: 7,
+  SUM: 8,
+  PANMAE: 9,
+  DIFF: 10,
+  LOCATION: 11,
+};
+
 function uint8ArrayToBase64(bytes) {
   let binary = "";
   const chunkSize = 0x8000;
@@ -1793,6 +1811,7 @@ async function saveCellChanges() {
   }
 
   // 3. 화면 갱신
+  aggregateTotalSheet(currentWorkbook);
   renderActiveSheet(currentSheetName);
 
   // 4. 모달 닫기
@@ -1864,152 +1883,190 @@ function exportUpdatedExcel() {
 
 /**
  * TOTAL 시트에 전체 구역(B1, B2 등) 재고 합산 집계를 기입하는 함수
- *  - TOTAL 시트의 A열 제품명을 읽어 키로 삼아
- *  - 모든 구역 시트에서 동일 제품명의 P(파렛트)/B(박스) 합계를 산출
- *  - TOTAL 시트 D열(P)과 E열(B)에 결과를 기입합니다.
+ *  - 창고 시트에 있는 제품 목록을 기준으로 TOTAL 행을 재구성 (이름 변경·삭제 반영)
+ *  - 제품별 P/B 합계 및 창고위치(L열) 기입
  */
-function aggregateTotalSheet(workbook) {
-  // TOTAL 시트 찾기 (대소문자 무관)
-  const totalSheetName = workbook.SheetNames.find(
+function findTotalSheet(workbook) {
+  const name = workbook.SheetNames.find(
     (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
   );
-  if (!totalSheetName) return; // TOTAL 시트 없으면 스킵
+  return name ? workbook.Sheets[name] : null;
+}
 
-  const totalSheet = workbook.Sheets[totalSheetName];
-  if (!totalSheet) return;
+function totalCellAddr(excelRow, col) {
+  return XLSX.utils.encode_cell({ r: excelRow - 1, c: col });
+}
 
-  // ① TOTAL 시트의 기존 제품 목록 파악 (A열, 5행부터 마지막 행까지)
-  //    엑셀 행 5 = SheetJS r 인덱스 4
-  const productRows = {}; // { "M300": 5행(엑셀 행번호), "M500": 6, ... }
-  let nextEmptyRow = 5;
-
-  for (let excelRow = 5; excelRow <= 300; excelRow++) {
-    const addr = XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 }); // A열 = c:0
-    const cell = totalSheet[addr];
-    if (!cell || cell.v === undefined || String(cell.v).trim() === "") {
-      nextEmptyRow = excelRow;
-      break;
-    }
-    const prodName = String(cell.v).trim();
-    productRows[prodName] = excelRow;
+function writeTotalCell(totalSheet, excelRow, col, val, type = "n") {
+  const addr = totalCellAddr(excelRow, col);
+  if (val === undefined || val === null || val === "") {
+    delete totalSheet[addr];
+    return;
   }
+  totalSheet[addr] = { t: type, v: val };
+  delete totalSheet[addr].w;
+}
 
-  // ② 각 구역 시트(TOTAL 시트 제외) 순회 → 제품별 P/B 합계 누적
-  const aggregated = {}; // { "M300": { pallet: 합계, box: 합계 }, ... }
+function collectWarehouseProductData(workbook) {
+  const aggregated = new Map();
 
   workbook.SheetNames.forEach((sheetName) => {
     if (isSummarySheetName(sheetName)) return;
-    if (!hasWarehouseLayout(workbook.Sheets[sheetName])) return; // TOTAL 자기 자신 스킵
-
     const sheet = workbook.Sheets[sheetName];
-    if (!sheet) return;
+    if (!sheet || !hasWarehouseLayout(sheet)) return;
 
     const maxCols = detectMaxCols(sheet);
     const maxRows = detectMaxRows(sheet);
-    const colMapping = detectColumnMapping(sheet, maxCols);
+    const colMapping = detectColumnMapping(sheet);
 
-    // 각 랙 셀 스캔 (동적 행/열 범위 적용)
     for (let r = 1; r <= maxRows; r++) {
       const prodRowIdx = 7 + 2 * (r - 1);
-      const qtyRowIdx  = 8 + 2 * (r - 1);
+      const qtyRowIdx = 8 + 2 * (r - 1);
 
       for (let c = 1; c <= maxCols; c++) {
         const pColIdx = colMapping[c];
         if (pColIdx === undefined) continue;
         const bColIdx = pColIdx + 1;
 
-        const prodAddr   = XLSX.utils.encode_cell({ r: prodRowIdx, c: pColIdx });
-        const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx,  c: pColIdx });
-        const boxAddr    = XLSX.utils.encode_cell({ r: qtyRowIdx,  c: bColIdx });
+        const prodCell = sheet[XLSX.utils.encode_cell({ r: prodRowIdx, c: pColIdx })];
+        if (!prodCell || prodCell.v === undefined) continue;
+        const prodName = String(prodCell.v).trim();
+        if (!prodName) continue;
 
-        const prodCell   = sheet[prodAddr];
-        const palletCell = sheet[palletAddr];
-        const boxCell    = sheet[boxAddr];
+        const palletCell = sheet[XLSX.utils.encode_cell({ r: qtyRowIdx, c: pColIdx })];
+        const boxCell = sheet[XLSX.utils.encode_cell({ r: qtyRowIdx, c: bColIdx })];
+        const pQty = palletCell?.v !== undefined ? Number(palletCell.v) || 0 : 0;
+        const bQty = boxCell?.v !== undefined ? Number(boxCell.v) || 0 : 0;
 
-        if (prodCell && prodCell.v !== undefined) {
-          const prodName = String(prodCell.v).trim();
-          if (!prodName) continue;
-
-          const pQty = (palletCell && palletCell.v !== undefined) ? (Number(palletCell.v) || 0) : 0;
-          const bQty = (boxCell    && boxCell.v    !== undefined) ? (Number(boxCell.v)    || 0) : 0;
-
-          if (pQty === 0 && bQty === 0) continue; // 수량 없으면 스킵
-
-          if (!aggregated[prodName]) {
-            aggregated[prodName] = { pallet: 0, box: 0 };
-          }
-          aggregated[prodName].pallet += pQty;
-          aggregated[prodName].box    += bQty;
+        if (!aggregated.has(prodName)) {
+          aggregated.set(prodName, { pallet: 0, box: 0, locations: new Set() });
         }
+        const entry = aggregated.get(prodName);
+        entry.pallet += pQty;
+        entry.box += bQty;
+        entry.locations.add(sheetName);
       }
     }
   });
 
-  // ②-2. TOTAL 시트에 없는 새로운 제품명이 다른 구역 시트에서 발견되면 목록 끝에 추가 등록
-  let isRangeUpdated = false;
-  for (const prodName of Object.keys(aggregated)) {
-    if (!productRows[prodName]) {
-      // 새로운 제품명을 TOTAL 시트 A열(제품명)에 기입
-      const aAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 0 }); // A열
-      totalSheet[aAddr] = { t: "s", v: prodName };
+  return aggregated;
+}
 
-      // G열(재고), I열(합계), K열(차이)에 기본 계산 수식 기입
-      const gAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 6 });  // G열: 재고
-      const iAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 8 });  // I열: 합계
-      const kAddr = XLSX.utils.encode_cell({ r: nextEmptyRow - 1, c: 10 }); // K열: 차이
+function readTotalSheetRowMetadata(totalSheet) {
+  const meta = new Map();
+  for (let excelRow = TOTAL_DATA_START_ROW; excelRow <= 300; excelRow++) {
+    const aCell = totalSheet[totalCellAddr(excelRow, TOTAL_COL.PRODUCT)];
+    if (!aCell || aCell.v === undefined || String(aCell.v).trim() === "") break;
+    const prodName = String(aCell.v).trim();
+    const readVal = (col) => {
+      const cell = totalSheet[totalCellAddr(excelRow, col)];
+      return cell?.v !== undefined ? cell.v : undefined;
+    };
+    meta.set(prodName, {
+      ipsuryang: readVal(TOTAL_COL.IPSUR),
+      box_danyi: readVal(TOTAL_COL.BOX_UNIT),
+      janryang: readVal(TOTAL_COL.JAN),
+      chulgo: readVal(TOTAL_COL.CHULGO),
+      panmae_ilbo: readVal(TOTAL_COL.PANMAE),
+    });
+  }
+  return meta;
+}
 
-      totalSheet[gAddr] = { t: "n", f: `((D${nextEmptyRow}*C${nextEmptyRow})+E${nextEmptyRow})*B${nextEmptyRow}+F${nextEmptyRow}` };
-      totalSheet[iAddr] = { t: "n", f: `G${nextEmptyRow}+H${nextEmptyRow}` };
-      totalSheet[kAddr] = { t: "n", f: `I${nextEmptyRow}-J${nextEmptyRow}` };
+function getTotalSheetLastDataRow(totalSheet) {
+  let lastRow = TOTAL_DATA_START_ROW - 1;
+  for (let excelRow = TOTAL_DATA_START_ROW; excelRow <= 300; excelRow++) {
+    const aCell = totalSheet[totalCellAddr(excelRow, TOTAL_COL.PRODUCT)];
+    if (!aCell || aCell.v === undefined || String(aCell.v).trim() === "") break;
+    lastRow = excelRow;
+  }
+  return lastRow;
+}
 
-      // productRows 매핑 정보 갱신 및 다음 빈 행 인덱스 증가
-      productRows[prodName] = nextEmptyRow;
-      nextEmptyRow++;
-      isRangeUpdated = true;
+function clearTotalSheetDataRows(totalSheet, fromRow, toRow) {
+  for (let excelRow = fromRow; excelRow <= toRow; excelRow++) {
+    for (let col = TOTAL_COL.PRODUCT; col <= TOTAL_COL.LOCATION; col++) {
+      delete totalSheet[totalCellAddr(excelRow, col)];
     }
   }
+}
 
-  // 만약 새로운 제품이 추가되어 행 수가 늘어났다면 TOTAL 시트의 데이터 범위(!ref) 갱신
-  if (isRangeUpdated && totalSheet["!ref"]) {
+function ensureTotalLocationHeader(totalSheet) {
+  writeTotalCell(totalSheet, TOTAL_HEADER_ROW, TOTAL_COL.LOCATION, "창고위치", "s");
+}
+
+function aggregateTotalSheet(workbook) {
+  const totalSheet = findTotalSheet(workbook);
+  if (!totalSheet) return;
+
+  ensureTotalLocationHeader(totalSheet);
+
+  const warehouseProducts = collectWarehouseProductData(workbook);
+  const preservedMeta = readTotalSheetRowMetadata(totalSheet);
+  const oldLastRow = getTotalSheetLastDataRow(totalSheet);
+
+  const sortedNames = [...warehouseProducts.keys()].sort((a, b) =>
+    a.localeCompare(b, "ko")
+  );
+
+  const clearUntil = Math.max(
+    oldLastRow,
+    sortedNames.length > 0
+      ? TOTAL_DATA_START_ROW + sortedNames.length - 1
+      : TOTAL_DATA_START_ROW - 1
+  );
+  if (clearUntil >= TOTAL_DATA_START_ROW) {
+    clearTotalSheetDataRows(totalSheet, TOTAL_DATA_START_ROW, clearUntil);
+  }
+
+  sortedNames.forEach((prodName, idx) => {
+    const excelRow = TOTAL_DATA_START_ROW + idx;
+    const totals = warehouseProducts.get(prodName);
+    const meta = preservedMeta.get(prodName) || {};
+    const locationText = [...totals.locations]
+      .sort((a, b) => a.localeCompare(b, "ko"))
+      .join(", ");
+
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.PRODUCT, prodName, "s");
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.IPSUR, meta.ipsuryang);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.BOX_UNIT, meta.box_danyi);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.PALLET, totals.pallet);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.BOX, totals.box);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.JAN, meta.janryang);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.CHULGO, meta.chulgo);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.PANMAE, meta.panmae_ilbo);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.LOCATION, locationText, "s");
+
+    totalSheet[totalCellAddr(excelRow, TOTAL_COL.STOCK)] = {
+      t: "n",
+      f: `((D${excelRow}*C${excelRow})+E${excelRow})*B${excelRow}+F${excelRow}`,
+    };
+    totalSheet[totalCellAddr(excelRow, TOTAL_COL.SUM)] = {
+      t: "n",
+      f: `G${excelRow}+H${excelRow}`,
+    };
+    totalSheet[totalCellAddr(excelRow, TOTAL_COL.DIFF)] = {
+      t: "n",
+      f: `I${excelRow}-J${excelRow}`,
+    };
+  });
+
+  if (totalSheet["!ref"]) {
     try {
       const range = XLSX.utils.decode_range(totalSheet["!ref"]);
-      if (nextEmptyRow - 1 > range.e.r) {
-        range.e.r = nextEmptyRow - 1;
-        totalSheet["!ref"] = XLSX.utils.encode_range(range);
-      }
+      const newLastRow =
+        sortedNames.length > 0
+          ? TOTAL_DATA_START_ROW + sortedNames.length - 1
+          : TOTAL_DATA_START_ROW - 1;
+      range.e.r = Math.max(range.e.r, newLastRow - 1);
+      range.e.c = Math.max(range.e.c, TOTAL_COL.LOCATION);
+      totalSheet["!ref"] = XLSX.utils.encode_range(range);
     } catch (e) {
       console.error("TOTAL 시트의 범위(!ref)를 갱신하는 데 실패했습니다.", e);
     }
   }
 
-  // ③ 집계 결과를 TOTAL 시트의 D열(P)과 E열(B)에 기입
-  //    엑셀 D열 = 인덱스 3, E열 = 인덱스 4
-  for (const [prodName, excelRow] of Object.entries(productRows)) {
-    const totals = aggregated[prodName] || { pallet: 0, box: 0 };
-
-    const pAddr = XLSX.utils.encode_cell({ r: excelRow - 1, c: 3 }); // D열
-    const bAddr = XLSX.utils.encode_cell({ r: excelRow - 1, c: 4 }); // E열
-
-    // 파렛트(P) 기입
-    if (!totalSheet[pAddr]) {
-      totalSheet[pAddr] = { t: "n", v: totals.pallet };
-    } else {
-      totalSheet[pAddr].t = "n";
-      totalSheet[pAddr].v = totals.pallet;
-      delete totalSheet[pAddr].w; // 캐시된 표시값 초기화
-    }
-
-    // 박스(B) 기입
-    if (!totalSheet[bAddr]) {
-      totalSheet[bAddr] = { t: "n", v: totals.box };
-    } else {
-      totalSheet[bAddr].t = "n";
-      totalSheet[bAddr].v = totals.box;
-      delete totalSheet[bAddr].w;
-    }
-  }
-
-  console.log("✅ TOTAL 시트 집계 완료:", aggregated);
+  console.log("✅ TOTAL 시트 집계 완료:", sortedNames.length, "품목");
 }
 
 
@@ -2204,7 +2261,7 @@ function applyTotalSheetStyles(sheet) {
   const fontName = "맑은 고딕";
 
   // ── 열 너비 최적화 ──────────────────────────────────────────
-  // A:제품명, B:입수량, C:박스단위, D:P, E:B, F:잔량, G:재고, H:출고, I:합계, J:판매일보, K:차이
+  // A:제품명, B:입수량, C:박스단위, D:P, E:B, F:잔량, G:재고, H:출고, I:합계, J:판매일보, K:차이, L:창고위치
   sheet["!cols"] = [
     { wch: 14 }, // A: 제품명
     { wch: 8  }, // B: 입수량
@@ -2217,6 +2274,7 @@ function applyTotalSheetStyles(sheet) {
     { wch: 12 }, // I: 합계
     { wch: 12 }, // J: 판매일보
     { wch: 10 }, // K: 차이
+    { wch: 16 }, // L: 창고위치
   ];
 
   // ── 공통 테두리 (진한 회색) ────────────────────────────────
@@ -2268,8 +2326,16 @@ function applyTotalSheetStyles(sheet) {
     border
   });
 
-  // ── 4행 헤더 스타일 적용 (A~K 열, 인덱스 0~10) ──────────
-  for (let col = 0; col <= 10; col++) {
+  // 창고위치(L열): 연보라 + 작은 글씨
+  const sLocation = (isOdd) => ({
+    font: { name: fontName, sz: 9, color: { rgb: "5B21B6" } },
+    fill: { patternType: "solid", fgColor: { rgb: isOdd ? "FAF5FF" : "F3E8FF" } },
+    alignment: { vertical: "center", horizontal: "center", wrapText: true },
+    border
+  });
+
+  // ── 4행 헤더 스타일 적용 (A~L 열, 인덱스 0~11) ──────────
+  for (let col = 0; col <= TOTAL_COL.LOCATION; col++) {
     const addr = XLSX.utils.encode_cell({ r: 3, c: col }); // 4행 = r:3
     if (!sheet[addr]) sheet[addr] = { t: "s", v: "" };
     sheet[addr].s = sHead;
@@ -2297,6 +2363,7 @@ function applyTotalSheetStyles(sheet) {
       sNum(isOdd),     // I: 합계 (col 8)
       sNum(isOdd),     // J: 판매일보 (col 9)
       sNum(isOdd),     // K: 차이 (col 10)
+      sLocation(isOdd), // L: 창고위치 (col 11)
     ];
 
     colStyles.forEach((style, colIdx) => {
@@ -2631,6 +2698,9 @@ async function importWorkbookToSupabase() {
 
   try {
     syncStatusEl.textContent = "🟡 DB 덮어쓰기 중...";
+
+    // TOTAL 시트를 창고 재고 기준으로 먼저 동기화 (제품명 변경·삭제 반영)
+    aggregateTotalSheet(currentWorkbook);
     
     // 1. 기존 데이터 초기화 (완전 덮어쓰기)
     const { error: delRackErr } = await supabaseClient.from('rack_inventory').delete().neq('sheet_name', '');
