@@ -133,12 +133,123 @@ function isAutoSyncOnUploadEnabled() {
   return stored === null || stored === "true";
 }
 
+const WORKBOOK_IDB_NAME = "upack-workbook-cache";
+const WORKBOOK_IDB_STORE = "files";
+const WORKBOOK_IDB_KEY = "current";
+const WORKBOOK_STORAGE_BUCKET = "workbooks";
+const WORKBOOK_STORAGE_PATH = "latest.xlsx";
+const LAST_SHEET_KEY = "last_sheet_name";
+
+function workbookToBytes(workbook) {
+  return XLSX.write(workbook, { bookType: "xlsx", type: "array", cellStyles: true });
+}
+
+function openWorkbookIdb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(WORKBOOK_IDB_NAME, 1);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(WORKBOOK_IDB_STORE)) {
+        db.createObjectStore(WORKBOOK_IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveWorkbookToLocalCache(workbook) {
+  if (!workbook) return;
+  try {
+    const bytes = workbookToBytes(workbook);
+    const db = await openWorkbookIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(WORKBOOK_IDB_STORE, "readwrite");
+      tx.objectStore(WORKBOOK_IDB_STORE).put(bytes, WORKBOOK_IDB_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+    localStorage.setItem("workbook_cache_active", "true");
+  } catch (e) {
+    console.warn("로컬 워크북 캐시 저장 실패:", e);
+  }
+}
+
+async function loadWorkbookBytesFromLocalCache() {
+  try {
+    if (localStorage.getItem("workbook_cache_active") !== "true") return null;
+    const db = await openWorkbookIdb();
+    const bytes = await new Promise((resolve, reject) => {
+      const tx = db.transaction(WORKBOOK_IDB_STORE, "readonly");
+      const req = tx.objectStore(WORKBOOK_IDB_STORE).get(WORKBOOK_IDB_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return bytes || null;
+  } catch (e) {
+    console.warn("로컬 워크북 캐시 로드 실패:", e);
+    return null;
+  }
+}
+
+async function uploadWorkbookToStorage(workbook) {
+  if (!supabaseClient || !workbook) return false;
+  try {
+    const bytes = workbookToBytes(workbook);
+    const blob = new Blob([bytes], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const { error } = await supabaseClient.storage
+      .from(WORKBOOK_STORAGE_BUCKET)
+      .upload(WORKBOOK_STORAGE_PATH, blob, { upsert: true, contentType: blob.type });
+    if (error) throw error;
+    return true;
+  } catch (e) {
+    console.warn("Supabase Storage 워크북 업로드 실패 (로컬 캐시는 유지됩니다):", e);
+    return false;
+  }
+}
+
+async function downloadWorkbookBytesFromStorage() {
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient.storage
+      .from(WORKBOOK_STORAGE_BUCKET)
+      .download(WORKBOOK_STORAGE_PATH);
+    if (error || !data) return null;
+    return new Uint8Array(await data.arrayBuffer());
+  } catch (e) {
+    console.warn("Supabase Storage 워크북 다운로드 실패:", e);
+    return null;
+  }
+}
+
+/** 업로드한 엑셀을 브라우저 캐시 + Supabase Storage에 보관 (새로고침·모바일 복원용) */
+async function persistUploadedWorkbook(workbook) {
+  if (!workbook) return;
+  await saveWorkbookToLocalCache(workbook);
+  if (isOnline) {
+    await uploadWorkbookToStorage(workbook);
+  }
+}
+
+function rememberLastSheet(sheetName) {
+  if (sheetName) localStorage.setItem(LAST_SHEET_KEY, sheetName);
+}
+
+function getRememberedSheet() {
+  return localStorage.getItem(LAST_SHEET_KEY) || "";
+}
+
 /**
  * 1. 이벤트 리스너 등록
  */
 fileInput.addEventListener("change", handleFileSelect);
 demoBtn.addEventListener("click", loadDemoWorkbook);
 sheetSelect.addEventListener("change", (e) => {
+  rememberLastSheet(e.target.value);
   renderActiveSheet(e.target.value);
 });
 searchInput.addEventListener("input", handleSearch);
@@ -380,6 +491,11 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   );
   sheetSelect.value = defaultSheet;
   renderActiveSheet(defaultSheet);
+  rememberLastSheet(defaultSheet);
+
+  if (fromUserUpload) {
+    persistUploadedWorkbook(workbook);
+  }
 
   if (isOnline && fromUserUpload && isAutoSyncOnUploadEnabled()) {
     // 렌더링 완료 후 DB에 자동 동기화 (확인창 없이 백그라운드 진행)
@@ -1890,22 +2006,44 @@ async function loadDataFromSupabase() {
     }
 
     syncStatusEl.textContent = "🟡 데이터 로드 중...";
-    
-    // 1. 서버에 올라가 있는 재고조사표 원본 템플릿 로드
-    let response;
-    try {
-      response = await fetch(`재고조사표.xlsx?v=${Date.now()}`, { cache: "no-store" });
-    } catch (e) {
-      throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+
+    // 1. 업로드 엑셀 복원 우선: Storage → 로컬 캐시 → 서버 기본 템플릿
+    let templateSource = "bundled";
+    let workbookBytes = null;
+
+    const storageBytes = await downloadWorkbookBytesFromStorage();
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+
+    if (storageBytes) {
+      workbookBytes = storageBytes;
+      templateSource = "storage";
+      isUserLocalWorkbook = true;
+    } else {
+      const cacheBytes = await loadWorkbookBytesFromLocalCache();
+      if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+      if (cacheBytes) {
+        workbookBytes = cacheBytes;
+        templateSource = "cache";
+        isUserLocalWorkbook = true;
+      }
     }
-    if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
 
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-    
-    const arrayBuffer = await response.arrayBuffer();
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+    if (!workbookBytes) {
+      let response;
+      try {
+        response = await fetch(`재고조사표.xlsx?v=${Date.now()}`, { cache: "no-store" });
+      } catch (e) {
+        throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+      }
+      if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
 
-    currentWorkbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array", cellStyles: true });
+      if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+      const arrayBuffer = await response.arrayBuffer();
+      if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+      workbookBytes = new Uint8Array(arrayBuffer);
+    }
+
+    currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
     
     // 2. Supabase에서 최신 랙 데이터 일괄 조회
     let dbRacks, rackError;
@@ -1946,11 +2084,18 @@ async function loadDataFromSupabase() {
     gridBoard.style.display = "grid";
     exportBtn.style.display = "inline-block";
 
-    const defaultSheet = resolveDefaultSheetName(currentWorkbook);
+    const defaultSheet = resolveDefaultSheetName(currentWorkbook, getRememberedSheet());
     sheetSelect.value = defaultSheet;
     renderActiveSheet(defaultSheet);
-    
-    syncStatusEl.textContent = "🟢 실시간 동기화 중";
+    rememberLastSheet(defaultSheet);
+
+    if (templateSource === "storage") {
+      syncStatusEl.textContent = "🟢 실시간 동기화 중 (업로드 엑셀 복원)";
+    } else if (templateSource === "cache") {
+      syncStatusEl.textContent = "🟢 실시간 동기화 중 (저장된 엑셀 복원)";
+    } else {
+      syncStatusEl.textContent = "🟢 실시간 동기화 중";
+    }
   } catch (err) {
     if (loadToken !== supabaseLoadToken) return;
     console.error("데이터베이스 로드 실패. 로컬 모드로 자동 백업 전환:", err);
@@ -2131,6 +2276,8 @@ async function importWorkbookToSupabase() {
     syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
     syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
     syncStatusEl.style.color = "#10b981";
+
+    await persistUploadedWorkbook(currentWorkbook);
   } catch (err) {
     alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
     console.error(err);
