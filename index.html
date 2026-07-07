@@ -90,6 +90,9 @@
         <span class="label">도면 규격:</span>
         <span id="layoutInfo" class="value">-</span>
       </div>
+      <div class="summary-item sync-diagnostics-item" style="flex: 1 1 100%;">
+        <span id="syncDiagnostics" class="label" style="color: var(--text-muted); font-size: 0.8rem;">DB 연결 상태 확인 중...</span>
+      </div>
     </div>
 
     <!-- 메인 대시보드 레이아웃 보드 판 -->
@@ -200,7 +203,8 @@
 
       <div class="modal-body">
         <p style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 1rem;">
-          Supabase 프로젝트 정보를 기입하면 PC와 모바일 간 실시간으로 데이터가 연동됩니다. 입력하지 않으면 로컬 엑셀 파일 업로드 모드로 작동합니다.
+          Supabase 프로젝트 정보를 기입하면 PC와 모바일 간 실시간으로 데이터가 연동됩니다.
+          <strong style="color: var(--accent-cyan);">모바일은 PC와 동일한 URL·Key를 직접 입력</strong>해야 합니다. (PC 설정이 자동 공유되지 않습니다)
         </p>
         
         <div class="form-group">
@@ -230,8 +234,6 @@
 
   <!-- Supabase JS 라이브러리 CDN 로드 및 연동 설정 파일 로드 -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="config.js" defer></script>
-  <!-- 애플리케이션 비즈니스 로직 스크립트 연결 -->
-  <script src="app.js?v=20260707f"></script>
+  <script src="app.js?v=20260708a" defer></script>
 </body>
 </html>

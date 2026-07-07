@@ -333,8 +333,58 @@ function rememberLastSheet(sheetName) {
   if (sheetName) localStorage.setItem(LAST_SHEET_KEY, sheetName);
 }
 
-function getRememberedSheet() {
-  return localStorage.getItem(LAST_SHEET_KEY) || "";
+async function fetchInventoryRacksFromDb() {
+  const { data, error } = await supabaseClient
+    .from("rack_inventory")
+    .select("sheet_name, rack_row, rack_col, product_name, pallet_qty, box_qty, updated_at")
+    .neq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+  if (error) throw error;
+  return data || [];
+}
+
+async function testSupabaseConnection(url, key) {
+  if (!window.supabase) {
+    return { ok: false, error: "Supabase SDK 로드 실패" };
+  }
+  try {
+    const client = window.supabase.createClient(url, key);
+    const { error } = await client
+      .from("rack_inventory")
+      .select("id", { count: "exact", head: true });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+function loadOptionalConfigScript() {
+  return new Promise((resolve) => {
+    if (window.SUPABASE_URL && window.SUPABASE_ANON_KEY) {
+      resolve();
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = `config.js?v=${Date.now()}`;
+    s.onload = () => resolve();
+    s.onerror = () => resolve();
+    document.head.appendChild(s);
+  });
+}
+
+function updateSyncDiagnostics(inventoryCount, hasWorkbookArchive, templateSource) {
+  const el = document.getElementById("syncDiagnostics");
+  if (!el) return;
+  if (!isOnline) {
+    el.textContent = "DB 미연결 — ⚙️ DB 설정에서 Supabase URL·Key를 입력하세요.";
+    return;
+  }
+  const parts = [
+    `DB 재고 ${inventoryCount}건`,
+    hasWorkbookArchive ? "업로드 엑셀 ✓" : "업로드 엑셀 ✗",
+    templateSource === "bundled" ? "기본 도면" : "업로드 도면",
+  ];
+  el.textContent = parts.join(" · ");
 }
 
 /**
@@ -2093,6 +2143,7 @@ function setOfflineMode() {
   syncStatusEl.style.background = "rgba(239, 68, 68, 0.1)";
   syncStatusEl.style.border = "1px solid rgba(239, 68, 68, 0.4)";
   syncStatusEl.style.color = "#ef4444";
+  updateSyncDiagnostics(0, false, "bundled");
 }
 
 // Supabase 서버 데이터 로드
@@ -2150,18 +2201,17 @@ async function loadDataFromSupabase() {
 
     currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
     
-    // 2. Supabase에서 최신 랙 데이터 일괄 조회
-    let dbRacks, rackError;
+    // 2. Supabase에서 재고 데이터만 조회 (엑셀 아카이브 대용량 제외 — 모바일 타임아웃 방지)
+    let dbRacks;
     try {
-      const res = await supabaseClient
-        .from('rack_inventory')
-        .select('*');
-      dbRacks = res.data;
-      rackError = res.error;
+      dbRacks = await fetchInventoryRacksFromDb();
     } catch (e) {
-      throw new Error("Supabase 서버(rack_inventory) 연결에 실패했습니다. (Failed to fetch)\n원인: 광고 차단 프로그램(AdBlock 등)이 Supabase 도메인을 차단하고 있을 수 있습니다.");
+      throw new Error(
+        "Supabase 서버(rack_inventory) 연결에 실패했습니다.\n" +
+          (e.message || e) +
+          "\n모바일: Wi-Fi/데이터 연결, ⚙️ DB 설정(URL·Key)을 확인해 주세요."
+      );
     }
-    if (rackError) throw rackError;
 
     if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
@@ -2206,23 +2256,55 @@ async function loadDataFromSupabase() {
     renderActiveSheet(defaultSheet);
     rememberLastSheet(defaultSheet);
 
+    const hasWorkbookArchive = templateSource !== "bundled";
+
     if (templateSource === "storage" || templateSource === "db") {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (업로드 엑셀 복원)";
+      syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+      syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+      syncStatusEl.style.color = "#10b981";
     } else if (templateSource === "cache") {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (저장된 엑셀 복원)";
+      syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+      syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+      syncStatusEl.style.color = "#10b981";
+    } else if (inventoryRacks.length > 0) {
+      syncStatusEl.textContent = "🟢 실시간 동기화 중 (재고 데이터 연결됨)";
+      syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+      syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+      syncStatusEl.style.color = "#10b981";
     } else if (isMobileViewport()) {
-      syncStatusEl.textContent = "🟡 기본 도면 — PC에서 엑셀 재업로드 필요";
+      syncStatusEl.textContent = "🟡 PC에서 엑셀 업로드 후 🔄 클라우드 동기화";
       syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
       syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
       syncStatusEl.style.color = "#fbbf24";
     } else {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (기본 템플릿)";
+      syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+      syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+      syncStatusEl.style.color = "#10b981";
     }
+
+    updateSyncDiagnostics(
+      inventoryRacks.length,
+      hasWorkbookArchive,
+      templateSource
+    );
   } catch (err) {
     if (loadToken !== supabaseLoadToken) return;
-    console.error("데이터베이스 로드 실패. 로컬 모드로 자동 백업 전환:", err);
-    alert("데이터베이스 연동에 실패했습니다.\n오류 내용: " + (err.message || err) + "\n\n오프라인 모드로 연동합니다.");
-    setOfflineMode();
+    console.error("데이터베이스 로드 실패:", err);
+    syncStatusEl.textContent = `🔴 동기화 실패 — ${err.message || err}`;
+    syncStatusEl.style.background = "rgba(239, 68, 68, 0.1)";
+    syncStatusEl.style.border = "1px solid rgba(239, 68, 68, 0.4)";
+    syncStatusEl.style.color = "#ef4444";
+    updateSyncDiagnostics(0, false, "bundled");
+    if (isMobileViewport()) {
+      alert(
+        "모바일 동기화 실패\n\n" +
+          (err.message || err) +
+          "\n\n① ⚙️ DB 설정 → PC와 동일한 URL·Key 입력\n② PC에서 엑셀 업로드\n③ 🔄 클라우드 동기화 버튼"
+      );
+    }
   }
 }
 
@@ -2524,15 +2606,35 @@ function saveDbConfig() {
     alert("URL과 Anon Key를 모두 입력해야 저장됩니다.");
     return;
   }
-  
-  localStorage.setItem("supabase_url", url);
-  localStorage.setItem("supabase_anon_key", key);
-  if (autoSyncOnUploadInput) {
-    localStorage.setItem("auto_sync_on_upload", autoSyncOnUploadInput.checked ? "true" : "false");
-  }
-  hideDbModal();
-  alert("설정이 저장되었습니다! 실시간 동기화를 위해 동적 연결을 활성화합니다.");
-  window.location.reload();
+
+  saveDbConfigBtn.disabled = true;
+  saveDbConfigBtn.textContent = "연결 확인 중...";
+
+  testSupabaseConnection(url, key).then(async (test) => {
+    saveDbConfigBtn.disabled = false;
+    saveDbConfigBtn.textContent = "연동 완료";
+
+    if (!test.ok) {
+      alert(
+        "Supabase 연결에 실패했습니다.\n\n" +
+          (test.error || "알 수 없는 오류") +
+          "\n\nURL·Anon Key를 PC Supabase 설정과 동일하게 입력했는지 확인해 주세요."
+      );
+      return;
+    }
+
+    localStorage.setItem("supabase_url", url);
+    localStorage.setItem("supabase_anon_key", key);
+    if (autoSyncOnUploadInput) {
+      localStorage.setItem("auto_sync_on_upload", autoSyncOnUploadInput.checked ? "true" : "false");
+    }
+    hideDbModal();
+    isUserLocalWorkbook = false;
+    isDbImportInProgress = false;
+    supabaseLoadToken += 1;
+    initSupabase();
+    alert("연결 성공! 데이터를 불러옵니다.");
+  });
 }
 
 function disconnectDb() {
@@ -2545,7 +2647,12 @@ function disconnectDb() {
   }
 }
 
-// 앱 구동 시 자동 데이터베이스 초기화 진행
+// 앱 구동 — config.js 로드 후 Supabase 초기화
+async function bootApplication() {
+  await loadOptionalConfigScript();
+  initSupabase();
+}
+
 window.addEventListener("resize", () => {
   if (currentSheetName && gridBoard.style.display !== "none") {
     const layout = gridBoard.dataset.layout || "";
@@ -2556,4 +2663,4 @@ window.addEventListener("resize", () => {
   }
 });
 
-initSupabase();
+bootApplication();
