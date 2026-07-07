@@ -756,6 +756,7 @@ header {
   .search-input, 
   .export-btn, 
   #demoBtn,
+  #cloudSyncBtn,
   #dbConfigBtn,
   #syncStatus {
     width: 100% !important;
@@ -773,6 +774,7 @@ header {
   .search-input, 
   .export-btn, 
   #demoBtn,
+  #cloudSyncBtn,
   #dbConfigBtn {
     padding: 0.8rem 1rem;
     font-size: 0.95rem;

@@ -126,6 +126,7 @@ const saveDbConfigBtn = document.getElementById("saveDbConfigBtn");
 const syncStatusEl = document.getElementById("syncStatus");
 const mobileScrollHint = document.getElementById("mobileScrollHint");
 const autoSyncOnUploadInput = document.getElementById("autoSyncOnUpload");
+const cloudSyncBtn = document.getElementById("cloudSyncBtn");
 
 /** 엑셀 업로드 시 Supabase 자동 동기화 여부 (기본값: 켜짐) */
 function isAutoSyncOnUploadEnabled() {
@@ -303,14 +304,29 @@ async function downloadWorkbookBytesFromDbSnapshot() {
 
 /** 업로드한 엑셀을 브라우저 캐시 + Supabase에 보관 (새로고침·모바일 복원용) */
 async function persistUploadedWorkbook(workbook) {
-  if (!workbook) return;
+  if (!workbook) return false;
   await saveWorkbookToLocalCache(workbook);
-  if (isOnline) {
-    await Promise.allSettled([
-      uploadWorkbookToStorage(workbook),
-      uploadWorkbookToDbSnapshot(workbook),
-    ]);
+  if (!isOnline) return true;
+  const results = await Promise.allSettled([
+    uploadWorkbookToStorage(workbook),
+    uploadWorkbookToDbSnapshot(workbook),
+  ]);
+  return results.some((r) => r.status === "fulfilled" && r.value === true);
+}
+
+function getInventoryRacks(dbRacks) {
+  return (dbRacks || []).filter((rack) => rack.sheet_name !== WORKBOOK_ARCHIVE_SHEET);
+}
+
+/** Supabase에서 최신 데이터를 다시 불러옴 (모바일 새로고침용) */
+async function reloadFromCloud() {
+  if (!isOnline || !supabaseClient) {
+    alert("Supabase 연동 후 사용할 수 있습니다. ⚙️ DB 설정을 확인해 주세요.");
+    return;
   }
+  isUserLocalWorkbook = false;
+  isDbImportInProgress = false;
+  await loadDataFromSupabase();
 }
 
 function rememberLastSheet(sheetName) {
@@ -358,6 +374,9 @@ if (autoSyncOnUploadInput) {
       autoSyncOnUploadInput.checked ? "true" : "false"
     );
   });
+}
+if (cloudSyncBtn) {
+  cloudSyncBtn.addEventListener("click", reloadFromCloud);
 }
 
 // 검색창 외부 영역 클릭 시 검색 결과 래퍼 닫기
@@ -572,7 +591,10 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   rememberLastSheet(defaultSheet);
 
   if (fromUserUpload) {
-    persistUploadedWorkbook(workbook);
+    const willAutoSync = isOnline && isAutoSyncOnUploadEnabled();
+    if (!willAutoSync) {
+      persistUploadedWorkbook(workbook);
+    }
   }
 
   if (isOnline && fromUserUpload && isAutoSyncOnUploadEnabled()) {
@@ -2095,21 +2117,18 @@ async function loadDataFromSupabase() {
     if (storageBytes) {
       workbookBytes = storageBytes;
       templateSource = "storage";
-      isUserLocalWorkbook = true;
     } else {
       const dbSnapshotBytes = await downloadWorkbookBytesFromDbSnapshot();
       if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
       if (dbSnapshotBytes) {
         workbookBytes = dbSnapshotBytes;
         templateSource = "db";
-        isUserLocalWorkbook = true;
       } else {
         const cacheBytes = await loadWorkbookBytesFromLocalCache();
         if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
         if (cacheBytes) {
           workbookBytes = cacheBytes;
           templateSource = "cache";
-          isUserLocalWorkbook = true;
         }
       }
     }
@@ -2161,8 +2180,20 @@ async function loadDataFromSupabase() {
 
     if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
-    // 4. 로컬 메모리 워크북 객체에 DB 데이터 반영
-    applyDbDataToWorkbook(dbRacks, dbMeta);
+    // 4. DB 데이터 반영 — 기본 템플릿이거나 재고 행이 있을 때만 셀 덮어쓰기
+    const inventoryRacks = getInventoryRacks(dbRacks);
+    if (templateSource === "bundled" || inventoryRacks.length > 0) {
+      applyDbDataToWorkbook(dbRacks, dbMeta);
+    } else {
+      productsMetadataCache = {};
+      (dbMeta || []).forEach((meta) => {
+        productsMetadataCache[meta.product_name] = meta;
+      });
+    }
+
+    if (templateSource !== "bundled") {
+      isUserLocalWorkbook = true;
+    }
 
     // 5. 가이드 숨기고 그리드 표시 영역 세팅
     updateSheetDropdown(getWarehouseSheetNames(currentWorkbook));
@@ -2197,7 +2228,7 @@ async function loadDataFromSupabase() {
 
 // 데이터베이스 조회 정보를 엑셀 워크북에 매핑해 넣는 로직
 function applyDbDataToWorkbook(dbRacks, dbMeta) {
-  if (isUserLocalWorkbook || isDbImportInProgress) return;
+  if (isDbImportInProgress) return;
 
   const totalSheetName = currentWorkbook.SheetNames.find(
     (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
@@ -2370,7 +2401,13 @@ async function importWorkbookToSupabase() {
     syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
     syncStatusEl.style.color = "#10b981";
 
-    await persistUploadedWorkbook(currentWorkbook);
+    const workbookSaved = await persistUploadedWorkbook(currentWorkbook);
+    if (!workbookSaved) {
+      syncStatusEl.textContent = "🟡 재고 동기화됨 (엑셀 파일 저장 실패 — PC에서 재업로드)";
+      syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
+      syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
+      syncStatusEl.style.color = "#fbbf24";
+    }
   } catch (err) {
     alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
     console.error(err);
@@ -2415,6 +2452,7 @@ function handleRealtimeRackChange(payload) {
   
   // 1. 메모리 상의 워크북 객체 실시간 수정
   if (eventType === 'DELETE') {
+    if (oldRow.sheet_name === WORKBOOK_ARCHIVE_SHEET) return;
     const sheet = currentWorkbook.Sheets[oldRow.sheet_name];
     if (sheet) {
       const colMapping = detectColumnMapping(sheet);
@@ -2434,6 +2472,7 @@ function handleRealtimeRackChange(payload) {
     }
   } else {
     // INSERT, UPDATE
+    if (newRow.sheet_name === WORKBOOK_ARCHIVE_SHEET) return;
     const sheet = currentWorkbook.Sheets[newRow.sheet_name];
     if (sheet) {
       const colMapping = detectColumnMapping(sheet);
