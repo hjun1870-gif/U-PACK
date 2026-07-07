@@ -138,7 +138,26 @@ const WORKBOOK_IDB_STORE = "files";
 const WORKBOOK_IDB_KEY = "current";
 const WORKBOOK_STORAGE_BUCKET = "workbooks";
 const WORKBOOK_STORAGE_PATH = "latest.xlsx";
+const WORKBOOK_SNAPSHOT_ID = "latest";
 const LAST_SHEET_KEY = "last_sheet_name";
+
+function uint8ArrayToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
 
 function workbookToBytes(workbook) {
   return XLSX.write(workbook, { bookType: "xlsx", type: "array", cellStyles: true });
@@ -226,12 +245,54 @@ async function downloadWorkbookBytesFromStorage() {
   }
 }
 
-/** 업로드한 엑셀을 브라우저 캐시 + Supabase Storage에 보관 (새로고침·모바일 복원용) */
+async function uploadWorkbookToDbSnapshot(workbook) {
+  if (!supabaseClient || !workbook) return false;
+  try {
+    const bytes = workbookToBytes(workbook);
+    const file_base64 = uint8ArrayToBase64(bytes);
+    const { error } = await supabaseClient
+      .from("workbook_snapshot")
+      .upsert(
+        {
+          id: WORKBOOK_SNAPSHOT_ID,
+          file_base64,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "id" }
+      );
+    if (error) throw error;
+    return true;
+  } catch (e) {
+    console.warn("Supabase DB 워크북 저장 실패:", e);
+    return false;
+  }
+}
+
+async function downloadWorkbookBytesFromDbSnapshot() {
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient
+      .from("workbook_snapshot")
+      .select("file_base64")
+      .eq("id", WORKBOOK_SNAPSHOT_ID)
+      .maybeSingle();
+    if (error || !data?.file_base64) return null;
+    return base64ToUint8Array(data.file_base64);
+  } catch (e) {
+    console.warn("Supabase DB 워크북 로드 실패:", e);
+    return null;
+  }
+}
+
+/** 업로드한 엑셀을 브라우저 캐시 + Supabase에 보관 (새로고침·모바일 복원용) */
 async function persistUploadedWorkbook(workbook) {
   if (!workbook) return;
   await saveWorkbookToLocalCache(workbook);
   if (isOnline) {
-    await uploadWorkbookToStorage(workbook);
+    await Promise.allSettled([
+      uploadWorkbookToStorage(workbook),
+      uploadWorkbookToDbSnapshot(workbook),
+    ]);
   }
 }
 
@@ -2007,7 +2068,7 @@ async function loadDataFromSupabase() {
 
     syncStatusEl.textContent = "🟡 데이터 로드 중...";
 
-    // 1. 업로드 엑셀 복원 우선: Storage → 로컬 캐시 → 서버 기본 템플릿
+    // 1. 업로드 엑셀 복원 우선: Storage → DB 스냅샷 → 로컬 캐시 → 서버 기본 템플릿
     let templateSource = "bundled";
     let workbookBytes = null;
 
@@ -2019,12 +2080,20 @@ async function loadDataFromSupabase() {
       templateSource = "storage";
       isUserLocalWorkbook = true;
     } else {
-      const cacheBytes = await loadWorkbookBytesFromLocalCache();
+      const dbSnapshotBytes = await downloadWorkbookBytesFromDbSnapshot();
       if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-      if (cacheBytes) {
-        workbookBytes = cacheBytes;
-        templateSource = "cache";
+      if (dbSnapshotBytes) {
+        workbookBytes = dbSnapshotBytes;
+        templateSource = "db";
         isUserLocalWorkbook = true;
+      } else {
+        const cacheBytes = await loadWorkbookBytesFromLocalCache();
+        if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+        if (cacheBytes) {
+          workbookBytes = cacheBytes;
+          templateSource = "cache";
+          isUserLocalWorkbook = true;
+        }
       }
     }
 
@@ -2089,12 +2158,17 @@ async function loadDataFromSupabase() {
     renderActiveSheet(defaultSheet);
     rememberLastSheet(defaultSheet);
 
-    if (templateSource === "storage") {
+    if (templateSource === "storage" || templateSource === "db") {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (업로드 엑셀 복원)";
     } else if (templateSource === "cache") {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (저장된 엑셀 복원)";
+    } else if (isMobileViewport()) {
+      syncStatusEl.textContent = "🟡 기본 도면 — PC에서 엑셀 재업로드 필요";
+      syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
+      syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
+      syncStatusEl.style.color = "#fbbf24";
     } else {
-      syncStatusEl.textContent = "🟢 실시간 동기화 중";
+      syncStatusEl.textContent = "🟢 실시간 동기화 중 (기본 템플릿)";
     }
   } catch (err) {
     if (loadToken !== supabaseLoadToken) return;
