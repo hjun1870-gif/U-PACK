@@ -141,7 +141,9 @@ const WORKBOOK_STORAGE_BUCKET = "workbooks";
 const WORKBOOK_STORAGE_PATH = "latest.xlsx";
 const WORKBOOK_SNAPSHOT_ID = "latest";
 const WORKBOOK_ARCHIVE_SHEET = "__WORKBOOK__";
-const WORKBOOK_CHUNK_SIZE = 45000;
+const WORKBOOK_LAYOUT_SHEET = "__LAYOUT__";
+const WORKBOOK_CHUNK_SIZE = 20000;
+const SYSTEM_SHEET_NAMES = [WORKBOOK_ARCHIVE_SHEET, WORKBOOK_LAYOUT_SHEET];
 const LAST_SHEET_KEY = "last_sheet_name";
 
 function uint8ArrayToBase64(bytes) {
@@ -164,6 +166,11 @@ function base64ToUint8Array(base64) {
 
 function workbookToBytes(workbook) {
   return XLSX.write(workbook, { bookType: "xlsx", type: "array", cellStyles: true });
+}
+
+/** DB 아카이브용 — 용량 축소 (cellStyles 제외) */
+function workbookToArchiveBytes(workbook) {
+  return XLSX.write(workbook, { bookType: "xlsx", type: "array", cellStyles: false });
 }
 
 function openWorkbookIdb() {
@@ -248,11 +255,49 @@ async function downloadWorkbookBytesFromStorage() {
   }
 }
 
+async function uploadWorkbookToSnapshotTable(workbook) {
+  if (!supabaseClient || !workbook) return false;
+  try {
+    const bytes = workbookToArchiveBytes(workbook);
+    if (!bytes || bytes.length < 100) throw new Error("엑셀 변환 결과가 비어 있습니다.");
+    const base64 = uint8ArrayToBase64(bytes);
+    const { error } = await supabaseClient.from("workbook_snapshot").upsert(
+      {
+        id: WORKBOOK_SNAPSHOT_ID,
+        file_base64: base64,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "id" }
+    );
+    if (error) throw error;
+    return true;
+  } catch (e) {
+    console.warn("workbook_snapshot 테이블 저장 실패 (마이그레이션 003 미적용 시 정상):", e);
+    return false;
+  }
+}
+
+async function downloadWorkbookBytesFromSnapshotTable() {
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient
+      .from("workbook_snapshot")
+      .select("file_base64")
+      .eq("id", WORKBOOK_SNAPSHOT_ID)
+      .maybeSingle();
+    if (error || !data?.file_base64) return null;
+    return base64ToUint8Array(data.file_base64);
+  } catch (e) {
+    console.warn("workbook_snapshot 테이블 로드 실패:", e);
+    return null;
+  }
+}
+
 async function uploadWorkbookToDbSnapshot(workbook) {
   if (!supabaseClient || !workbook) return false;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const bytes = workbookToBytes(workbook);
+      const bytes = workbookToArchiveBytes(workbook);
       if (!bytes || bytes.length < 100) throw new Error("엑셀 변환 결과가 비어 있습니다.");
 
       const base64 = uint8ArrayToBase64(bytes);
@@ -261,10 +306,11 @@ async function uploadWorkbookToDbSnapshot(workbook) {
         chunks.push(base64.slice(i, i + WORKBOOK_CHUNK_SIZE));
       }
 
-      await supabaseClient
+      const { error: delErr } = await supabaseClient
         .from("rack_inventory")
         .delete()
         .eq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+      if (delErr) throw delErr;
 
       const rows = chunks.map((chunk, index) => ({
         sheet_name: WORKBOOK_ARCHIVE_SHEET,
@@ -275,19 +321,23 @@ async function uploadWorkbookToDbSnapshot(workbook) {
         box_qty: base64.length,
       }));
 
-      for (let i = 0; i < rows.length; i += 50) {
-        const { error } = await supabaseClient
-          .from("rack_inventory")
-          .insert(rows.slice(i, i + 50));
+      for (const row of rows) {
+        const { error } = await supabaseClient.from("rack_inventory").insert(row);
         if (error) throw error;
       }
 
-      const verified = await downloadWorkbookBytesFromDbSnapshot();
-      if (!verified) throw new Error("업로드 후 검증 실패");
+      const { count, error: countErr } = await supabaseClient
+        .from("rack_inventory")
+        .select("id", { count: "exact", head: true })
+        .eq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+      if (countErr || count !== rows.length) {
+        throw new Error(`청크 검증 실패 (${count}/${rows.length})`);
+      }
       return true;
     } catch (e) {
-      console.warn(`Supabase DB 워크북 저장 실패 (시도 ${attempt}/2):`, e);
-      if (attempt === 2) return false;
+      console.warn(`Supabase DB 워크북 저장 실패 (시도 ${attempt}/3):`, e);
+      if (attempt === 3) return false;
+      await new Promise((r) => setTimeout(r, 800 * attempt));
     }
   }
   return false;
@@ -315,7 +365,15 @@ async function persistUploadedWorkbook(workbook) {
   if (!workbook) return false;
   await saveWorkbookToLocalCache(workbook);
   if (!isOnline) return true;
+  if (supabaseClient) {
+    try {
+      await saveSheetLayoutsToDb(workbook);
+    } catch (e) {
+      console.warn("도면 레이아웃 DB 저장 실패:", e);
+    }
+  }
   const results = await Promise.allSettled([
+    uploadWorkbookToSnapshotTable(workbook),
     uploadWorkbookToStorage(workbook),
     uploadWorkbookToDbSnapshot(workbook),
   ]);
@@ -323,7 +381,112 @@ async function persistUploadedWorkbook(workbook) {
 }
 
 function getInventoryRacks(dbRacks) {
-  return (dbRacks || []).filter((rack) => rack.sheet_name !== WORKBOOK_ARCHIVE_SHEET);
+  return (dbRacks || []).filter((rack) => !SYSTEM_SHEET_NAMES.includes(rack.sheet_name));
+}
+
+async function fetchLayoutRowsFromDb() {
+  if (!supabaseClient) return [];
+  try {
+    const { data, error } = await supabaseClient
+      .from("rack_inventory")
+      .select("rack_row, rack_col, product_name, pallet_qty, box_qty")
+      .eq("sheet_name", WORKBOOK_LAYOUT_SHEET)
+      .order("rack_row", { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    console.warn("도면 레이아웃 조회 실패:", e);
+    return [];
+  }
+}
+
+async function saveSheetLayoutsToDb(workbook) {
+  if (!supabaseClient || !workbook) return false;
+  const rows = getWarehouseSheetNames(workbook).map((sheetName, idx) => {
+    const sheet = workbook.Sheets[sheetName];
+    const { leftRacks, rightRacks } = detectRacks(sheet);
+    return {
+      sheet_name: WORKBOOK_LAYOUT_SHEET,
+      rack_row: idx + 1,
+      rack_col: leftRacks.length,
+      product_name: sheetName,
+      pallet_qty: rightRacks.length,
+      box_qty: detectMaxRows(sheet),
+    };
+  });
+  const { error: delErr } = await supabaseClient
+    .from("rack_inventory")
+    .delete()
+    .eq("sheet_name", WORKBOOK_LAYOUT_SHEET);
+  if (delErr) throw delErr;
+  if (rows.length === 0) return true;
+  for (const row of rows) {
+    const { error } = await supabaseClient.from("rack_inventory").insert(row);
+    if (error) throw error;
+  }
+  return true;
+}
+
+function getLayoutMapFromDb(layoutRows) {
+  const map = {};
+  (layoutRows || []).forEach((row) => {
+    if (!row.product_name) return;
+    map[row.product_name] = {
+      leftCols: row.rack_col || 0,
+      rightCols: row.pallet_qty || 0,
+      maxRows: row.box_qty || 18,
+    };
+  });
+  return map;
+}
+
+/** DB 재고·레이아웃만으로 창고 도면 워크북 생성 (엑셀 아카이브 없을 때 모바일 복원용) */
+function createWarehouseLayoutSheet(sheetName, totalCols, maxRows) {
+  const sheet = {};
+  const safeCols = Math.max(4, totalCols || 11);
+  const safeRows = Math.max(4, maxRows || 18);
+  const lastColIdx = safeCols <= 9 ? 2 * safeCols : 2 * safeCols + 1;
+  sheet["!ref"] = `A1:${XLSX.utils.encode_col(lastColIdx + 2)}${7 + 2 * safeRows + 2}`;
+  sheet["C4"] = { t: "s", v: `<재고조사표 - ${sheetName}>` };
+
+  for (let c = 1; c <= safeCols; c++) {
+    const pColIdx = c <= 9 ? 2 * c - 1 : 2 * c + 1;
+    const bColIdx = pColIdx + 1;
+    sheet[XLSX.utils.encode_cell({ r: 4, c: pColIdx })] = { t: "n", v: c };
+    sheet[XLSX.utils.encode_cell({ r: 5, c: pColIdx })] = { t: "s", v: "제품" };
+    sheet[XLSX.utils.encode_cell({ r: 6, c: pColIdx })] = { t: "s", v: "P" };
+    sheet[XLSX.utils.encode_cell({ r: 6, c: bColIdx })] = { t: "s", v: "B" };
+  }
+  for (let r = 1; r <= safeRows; r++) {
+    sheet[XLSX.utils.encode_cell({ r: 7 + 2 * (r - 1), c: 0 })] = { t: "n", v: r };
+  }
+  return sheet;
+}
+
+function buildWorkbookFromDbInventory(dbRacks, layoutRows = []) {
+  const inventory = getInventoryRacks(dbRacks);
+  const layoutMap = getLayoutMapFromDb(layoutRows);
+  const sheetNames = [...new Set(inventory.map((r) => r.sheet_name))].filter(Boolean);
+  const wb = XLSX.utils.book_new();
+
+  sheetNames.forEach((sheetName) => {
+    const racks = inventory.filter((r) => r.sheet_name === sheetName);
+    const layout = layoutMap[sheetName];
+    const maxRow = layout?.maxRows || Math.max(18, ...racks.map((r) => r.rack_row));
+    let totalCols;
+    if (layout?.leftCols && layout?.rightCols) {
+      totalCols = layout.leftCols + layout.rightCols;
+    } else {
+      totalCols = Math.max(11, ...racks.map((r) => r.rack_col));
+    }
+    XLSX.utils.book_append_sheet(
+      wb,
+      createWarehouseLayoutSheet(sheetName, totalCols, maxRow),
+      sheetName
+    );
+  });
+
+  return wb;
 }
 
 function getDbSheetNames(dbRacks) {
@@ -337,6 +500,9 @@ function getSheetMismatch(dbRacks, workbook) {
 }
 
 async function tryLoadArchivedWorkbookBytes() {
+  const snapshotBytes = await downloadWorkbookBytesFromSnapshotTable();
+  if (snapshotBytes) return { bytes: snapshotBytes, source: "snapshot" };
+
   const storageBytes = await downloadWorkbookBytesFromStorage();
   if (storageBytes) return { bytes: storageBytes, source: "storage" };
 
@@ -379,7 +545,7 @@ async function fetchInventoryRacksFromDb() {
   const { data, error } = await supabaseClient
     .from("rack_inventory")
     .select("sheet_name, rack_row, rack_col, product_name, pallet_qty, box_qty, updated_at")
-    .neq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+    .not("sheet_name", "in", `(${SYSTEM_SHEET_NAMES.map((n) => `"${n}"`).join(",")})`);
   if (error) throw error;
   return data || [];
 }
@@ -433,6 +599,9 @@ function updateSyncDiagnostics(inventoryCount, hasWorkbookArchive, templateSourc
   if (!hasWorkbookArchive && dbSheetNames.length > 0 && templateSource === "bundled") {
     el.textContent += " — ⚠️ PC에서 엑셀 재업로드 필요 (시트 불일치)";
     el.style.color = "#fbbf24";
+  } else if (templateSource === "db-layout" || templateSource === "db-generated") {
+    el.textContent += " — DB 도면 복원";
+    el.style.color = "#10b981";
   } else {
     el.style.color = "var(--text-muted)";
   }
@@ -2227,8 +2396,10 @@ async function loadDataFromSupabase() {
 
     const inventoryRacks = getInventoryRacks(dbRacks);
     const dbSheetNames = getDbSheetNames(dbRacks);
+    const layoutRows = await fetchLayoutRowsFromDb();
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
-    // 2. 업로드 엑셀 복원 (DB에 재고가 있으면 아카이브 우선 — B1 vs 셀 불일치 방지)
+    // 2. 업로드 엑셀 복원 → 없으면 DB 재고로 도면 자동 생성 (B1 vs 셀 불일치 방지)
     let templateSource = "bundled";
     let workbookBytes = null;
 
@@ -2238,16 +2409,12 @@ async function loadDataFromSupabase() {
     if (archived) {
       workbookBytes = archived.bytes;
       templateSource = archived.source;
-    } else if (inventoryRacks.length === 0) {
-      try {
-        workbookBytes = await loadBundledWorkbookBytes();
-      } catch (e) {
-        throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
-      }
+    } else if (inventoryRacks.length > 0) {
+      currentWorkbook = buildWorkbookFromDbInventory(dbRacks, layoutRows);
+      templateSource = layoutRows.length > 0 ? "db-layout" : "db-generated";
     } else {
       try {
         workbookBytes = await loadBundledWorkbookBytes();
-        templateSource = "bundled";
       } catch (e) {
         throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
       }
@@ -2255,16 +2422,15 @@ async function loadDataFromSupabase() {
 
     if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
-    currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
+    if (workbookBytes) {
+      currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
+    }
 
     let sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
-    if (sheetMismatch.length > 0 && templateSource === "bundled") {
-      const retryArchived = await tryLoadArchivedWorkbookBytes();
-      if (retryArchived) {
-        currentWorkbook = XLSX.read(retryArchived.bytes, { type: "array", cellStyles: true });
-        templateSource = retryArchived.source;
-        sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
-      }
+    if (sheetMismatch.length > 0 && inventoryRacks.length > 0) {
+      currentWorkbook = buildWorkbookFromDbInventory(dbRacks, layoutRows);
+      templateSource = layoutRows.length > 0 ? "db-layout" : "db-generated";
+      sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
     }
 
     // 3. Supabase에서 최신 제품 메타데이터 조회
@@ -2317,7 +2483,10 @@ async function loadDataFromSupabase() {
     renderActiveSheet(defaultSheet);
     rememberLastSheet(defaultSheet);
 
-    const hasWorkbookArchive = templateSource !== "bundled";
+    const hasWorkbookArchive =
+      templateSource !== "bundled" &&
+      templateSource !== "db-generated" &&
+      templateSource !== "db-layout";
 
     if (sheetMismatch.length > 0 && templateSource === "bundled") {
       syncStatusEl.textContent = `🟡 시트 불일치 (DB: ${sheetMismatch.slice(0, 2).join(", ")}) — PC에서 엑셀 재업로드`;
@@ -2329,7 +2498,12 @@ async function loadDataFromSupabase() {
           `PC와 모바일 도면이 다릅니다.\n\nDB 재고 시트: ${dbSheetNames.join(", ")}\n모바일 도면: ${wbSheetNames.join(", ")}\n\nPC에서 엑셀을 다시 업로드한 뒤 모바일에서 🔄 클라우드 동기화를 눌러 주세요.`
         );
       }
-    } else if (templateSource === "storage" || templateSource === "db") {
+    } else if (templateSource === "db-layout" || templateSource === "db-generated") {
+      syncStatusEl.textContent = "🟢 실시간 동기화 중 (DB 재고 도면 복원)";
+      syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+      syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+      syncStatusEl.style.color = "#10b981";
+    } else if (templateSource === "snapshot" || templateSource === "storage" || templateSource === "db") {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (업로드 엑셀 복원)";
       syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
       syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
@@ -2423,7 +2597,7 @@ function applyDbDataToWorkbook(dbRacks, dbMeta) {
 
   // DB 랙 데이터를 엑셀 메모리에 덮어쓰기 (워크북 아카이브 행 제외)
   dbRacks
-    .filter((rack) => rack.sheet_name !== WORKBOOK_ARCHIVE_SHEET)
+    .filter((rack) => !SYSTEM_SHEET_NAMES.includes(rack.sheet_name))
     .forEach((rack) => {
     const sheet = currentWorkbook.Sheets[rack.sheet_name];
     if (!sheet) return;
@@ -2542,6 +2716,8 @@ async function importWorkbookToSupabase() {
       }
     }
 
+    await saveSheetLayoutsToDb(currentWorkbook);
+
     // 3. 업로드한 워크북/레이아웃 유지 — 서버 템플릿 재로드 없음
     isUserLocalWorkbook = true;
     if (savedSheetName && currentWorkbook.Sheets[savedSheetName]) {
@@ -2558,12 +2734,12 @@ async function importWorkbookToSupabase() {
 
     const workbookSaved = await persistUploadedWorkbook(currentWorkbook);
     if (!workbookSaved) {
-      syncStatusEl.textContent = "🟡 재고 동기화됨 — 엑셀 파일 DB 저장 실패 (모바일 불일치)";
+      syncStatusEl.textContent = "🟡 재고 동기화됨 — 엑셀 파일 저장 실패 (모바일은 DB 도면 복원)";
       syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
       syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
       syncStatusEl.style.color = "#fbbf24";
       alert(
-        "재고 데이터는 DB에 저장됐지만, 엑셀 도면 파일 저장에 실패했습니다.\n모바일에서 PC와 다른 화면이 보일 수 있습니다.\n\n엑셀을 한 번 더 업로드해 주세요."
+        "재고·도면 레이아웃은 DB에 저장됐습니다.\n엑셀 원본 파일 저장만 실패했 — 모바일은 DB 재고 도면으로 표시됩니다.\n\n더 정확한 도면을 위해 엑셀을 한 번 더 업로드해 주세요."
       );
     }
   } catch (err) {
