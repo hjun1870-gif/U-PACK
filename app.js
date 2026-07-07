@@ -114,6 +114,7 @@ const inputPallet = document.getElementById("inputPallet");
 const inputBox = document.getElementById("inputBox");
 const cancelBtn = document.getElementById("cancelBtn");
 const saveBtn = document.getElementById("saveBtn");
+const deleteBtn = document.getElementById("deleteBtn");
 
 // DB 설정 모달 캐싱
 const dbConfigBtn = document.getElementById("dbConfigBtn");
@@ -646,6 +647,9 @@ window.addEventListener("click", (e) => {
   if (e.target === editModal) hideModal();
 });
 saveBtn.addEventListener("click", saveCellChanges);
+if (deleteBtn) {
+  deleteBtn.addEventListener("click", deleteCellChanges);
+}
 
 // DB 설정 모달 리스너
 dbConfigBtn.addEventListener("click", showDbModal);
@@ -1740,6 +1744,12 @@ function showEditModal(row, col, cellData, rackNo) {
   inputPallet.value = cellData.pallet || 0;
   inputBox.value = cellData.box || 0;
 
+  const hasData = Boolean(cellData.product || cellData.pallet || cellData.box);
+  if (deleteBtn) {
+    deleteBtn.disabled = !hasData;
+    deleteBtn.style.display = hasData ? "" : "none";
+  }
+
   editModal.classList.add("show");
   document.body.classList.add("modal-open");
   if (isMobileViewport()) {
@@ -1760,48 +1770,40 @@ function hideModal() {
 /**
  * 사용자가 수정한 재고를 엑셀 데이터 구조에 반영하고 화면을 새로고침합니다.
  */
-async function saveCellChanges() {
+async function applyCellChanges(newProduct, newPallet, newBox) {
   if (!selectedCellInfo || !currentSheetData) return;
-
-  const newProduct = inputProduct.value.trim();
-  const newPallet = parseInt(inputPallet.value, 10) || 0;
-  const newBox = parseInt(inputBox.value, 10) || 0;
 
   const sheet = currentSheetData;
   const cellInfo = selectedCellInfo.data;
 
-  // 1. 엑셀 워크시트 객체에 새 데이터 써넣기
-  updateExcelCellValue(sheet, cellInfo.prodCellAddress, newProduct, 's');
-  updateExcelCellValue(sheet, cellInfo.palletCellAddress, newPallet, 'n');
-  updateExcelCellValue(sheet, cellInfo.boxCellAddress, newBox, 'n');
+  updateExcelCellValue(sheet, cellInfo.prodCellAddress, newProduct, "s");
+  updateExcelCellValue(sheet, cellInfo.palletCellAddress, newPallet, "n");
+  updateExcelCellValue(sheet, cellInfo.boxCellAddress, newBox, "n");
 
-  // 2. 온라인 모드면 Supabase에 비동기 저장
   if (isOnline) {
     try {
       if (newProduct === "" && newPallet === 0 && newBox === 0) {
-        // 비어있는 데이터는 DB에서 삭제 처리
         await supabaseClient
-          .from('rack_inventory')
+          .from("rack_inventory")
           .delete()
           .match({
             sheet_name: currentSheetName,
             rack_row: selectedCellInfo.row,
-            rack_col: selectedCellInfo.col
+            rack_col: selectedCellInfo.col,
           });
       } else {
-        // 데이터가 존재하면 Upsert 처리
-        const { error } = await supabaseClient
-          .from('rack_inventory')
-          .upsert({
+        const { error } = await supabaseClient.from("rack_inventory").upsert(
+          {
             sheet_name: currentSheetName,
             rack_row: selectedCellInfo.row,
             rack_col: selectedCellInfo.col,
             product_name: newProduct,
             pallet_qty: newPallet,
             box_qty: newBox,
-            updated_at: new Date().toISOString()
-          }, { onConflict: 'sheet_name,rack_row,rack_col' });
-          
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "sheet_name,rack_row,rack_col" }
+        );
         if (error) throw error;
       }
     } catch (e) {
@@ -1810,12 +1812,28 @@ async function saveCellChanges() {
     }
   }
 
-  // 3. 화면 갱신
   aggregateTotalSheet(currentWorkbook);
   renderActiveSheet(currentSheetName);
-
-  // 4. 모달 닫기
   hideModal();
+}
+
+async function saveCellChanges() {
+  await applyCellChanges(
+    inputProduct.value.trim(),
+    parseInt(inputPallet.value, 10) || 0,
+    parseInt(inputBox.value, 10) || 0
+  );
+}
+
+async function deleteCellChanges() {
+  if (!selectedCellInfo) return;
+  const cellData = selectedCellInfo.data || {};
+  if (!cellData.product && !cellData.pallet && !cellData.box) {
+    hideModal();
+    return;
+  }
+  if (!confirm("이 셀의 재고 정보를 삭제할까요?")) return;
+  await applyCellChanges("", 0, 0);
 }
 
 /**
