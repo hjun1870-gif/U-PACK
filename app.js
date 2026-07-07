@@ -250,39 +250,47 @@ async function downloadWorkbookBytesFromStorage() {
 
 async function uploadWorkbookToDbSnapshot(workbook) {
   if (!supabaseClient || !workbook) return false;
-  try {
-    const bytes = workbookToBytes(workbook);
-    const base64 = uint8ArrayToBase64(bytes);
-    const chunks = [];
-    for (let i = 0; i < base64.length; i += WORKBOOK_CHUNK_SIZE) {
-      chunks.push(base64.slice(i, i + WORKBOOK_CHUNK_SIZE));
-    }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const bytes = workbookToBytes(workbook);
+      if (!bytes || bytes.length < 100) throw new Error("엑셀 변환 결과가 비어 있습니다.");
 
-    await supabaseClient
-      .from("rack_inventory")
-      .delete()
-      .eq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+      const base64 = uint8ArrayToBase64(bytes);
+      const chunks = [];
+      for (let i = 0; i < base64.length; i += WORKBOOK_CHUNK_SIZE) {
+        chunks.push(base64.slice(i, i + WORKBOOK_CHUNK_SIZE));
+      }
 
-    const rows = chunks.map((chunk, index) => ({
-      sheet_name: WORKBOOK_ARCHIVE_SHEET,
-      rack_row: index + 1,
-      rack_col: 0,
-      product_name: chunk,
-      pallet_qty: chunks.length,
-      box_qty: base64.length,
-    }));
-
-    for (let i = 0; i < rows.length; i += 50) {
-      const { error } = await supabaseClient
+      await supabaseClient
         .from("rack_inventory")
-        .insert(rows.slice(i, i + 50));
-      if (error) throw error;
+        .delete()
+        .eq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+
+      const rows = chunks.map((chunk, index) => ({
+        sheet_name: WORKBOOK_ARCHIVE_SHEET,
+        rack_row: index + 1,
+        rack_col: 0,
+        product_name: chunk,
+        pallet_qty: chunks.length,
+        box_qty: base64.length,
+      }));
+
+      for (let i = 0; i < rows.length; i += 50) {
+        const { error } = await supabaseClient
+          .from("rack_inventory")
+          .insert(rows.slice(i, i + 50));
+        if (error) throw error;
+      }
+
+      const verified = await downloadWorkbookBytesFromDbSnapshot();
+      if (!verified) throw new Error("업로드 후 검증 실패");
+      return true;
+    } catch (e) {
+      console.warn(`Supabase DB 워크북 저장 실패 (시도 ${attempt}/2):`, e);
+      if (attempt === 2) return false;
     }
-    return true;
-  } catch (e) {
-    console.warn("Supabase DB 워크북 저장 실패:", e);
-    return false;
   }
+  return false;
 }
 
 async function downloadWorkbookBytesFromDbSnapshot() {
@@ -316,6 +324,36 @@ async function persistUploadedWorkbook(workbook) {
 
 function getInventoryRacks(dbRacks) {
   return (dbRacks || []).filter((rack) => rack.sheet_name !== WORKBOOK_ARCHIVE_SHEET);
+}
+
+function getDbSheetNames(dbRacks) {
+  return [...new Set(getInventoryRacks(dbRacks).map((r) => r.sheet_name))].filter(Boolean);
+}
+
+function getSheetMismatch(dbRacks, workbook) {
+  if (!workbook) return [];
+  const wbSheets = new Set(workbook.SheetNames);
+  return getDbSheetNames(dbRacks).filter((name) => !wbSheets.has(name));
+}
+
+async function tryLoadArchivedWorkbookBytes() {
+  const storageBytes = await downloadWorkbookBytesFromStorage();
+  if (storageBytes) return { bytes: storageBytes, source: "storage" };
+
+  const dbSnapshotBytes = await downloadWorkbookBytesFromDbSnapshot();
+  if (dbSnapshotBytes) return { bytes: dbSnapshotBytes, source: "db" };
+
+  const cacheBytes = await loadWorkbookBytesFromLocalCache();
+  if (cacheBytes) return { bytes: cacheBytes, source: "cache" };
+
+  return null;
+}
+
+async function loadBundledWorkbookBytes() {
+  const response = await fetch(`재고조사표.xlsx?v=${Date.now()}`, { cache: "no-store" });
+  if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
+  const arrayBuffer = await response.arrayBuffer();
+  return new Uint8Array(arrayBuffer);
 }
 
 /** Supabase에서 최신 데이터를 다시 불러옴 (모바일 새로고침용) */
@@ -376,19 +414,28 @@ function loadOptionalConfigScript() {
   });
 }
 
-function updateSyncDiagnostics(inventoryCount, hasWorkbookArchive, templateSource) {
+function updateSyncDiagnostics(inventoryCount, hasWorkbookArchive, templateSource, dbSheetNames = [], wbSheetNames = []) {
   const el = document.getElementById("syncDiagnostics");
   if (!el) return;
   if (!isOnline) {
     el.textContent = "DB 미연결 — ⚙️ DB 설정에서 Supabase URL·Key를 입력하세요.";
     return;
   }
+  const dbLabel = dbSheetNames.length ? dbSheetNames.slice(0, 4).join(", ") : "-";
+  const wbLabel = wbSheetNames.length ? wbSheetNames.slice(0, 4).join(", ") : "-";
   const parts = [
     `DB 재고 ${inventoryCount}건`,
     hasWorkbookArchive ? "업로드 엑셀 ✓" : "업로드 엑셀 ✗",
-    templateSource === "bundled" ? "기본 도면" : "업로드 도면",
+    `DB시트: ${dbLabel}`,
+    `도면: ${wbLabel}`,
   ];
   el.textContent = parts.join(" · ");
+  if (!hasWorkbookArchive && dbSheetNames.length > 0 && templateSource === "bundled") {
+    el.textContent += " — ⚠️ PC에서 엑셀 재업로드 필요 (시트 불일치)";
+    el.style.color = "#fbbf24";
+  } else {
+    el.style.color = "var(--text-muted)";
+  }
 }
 
 /**
@@ -541,12 +588,15 @@ function parseSheetHeaderLabel(sheet, sheetName) {
 /**
  * 업로드 후 기본으로 열 창고 시트 결정
  */
-function resolveDefaultSheetName(workbook, preferredName) {
+function resolveDefaultSheetName(workbook, preferredName, dbSheetNames = []) {
   const warehouseSheets = getWarehouseSheetNames(workbook);
   if (warehouseSheets.length === 0) return workbook.SheetNames[0] || "";
 
   if (preferredName && warehouseSheets.includes(preferredName)) {
     return preferredName;
+  }
+  for (const name of dbSheetNames) {
+    if (warehouseSheets.includes(name)) return name;
   }
   return warehouseSheets[0];
 }
@@ -2162,50 +2212,7 @@ async function loadDataFromSupabase() {
 
     syncStatusEl.textContent = "🟡 데이터 로드 중...";
 
-    // 1. 업로드 엑셀 복원 우선: Storage → DB 스냅샷 → 로컬 캐시 → 서버 기본 템플릿
-    let templateSource = "bundled";
-    let workbookBytes = null;
-
-    const storageBytes = await downloadWorkbookBytesFromStorage();
-    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-
-    if (storageBytes) {
-      workbookBytes = storageBytes;
-      templateSource = "storage";
-    } else {
-      const dbSnapshotBytes = await downloadWorkbookBytesFromDbSnapshot();
-      if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-      if (dbSnapshotBytes) {
-        workbookBytes = dbSnapshotBytes;
-        templateSource = "db";
-      } else {
-        const cacheBytes = await loadWorkbookBytesFromLocalCache();
-        if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-        if (cacheBytes) {
-          workbookBytes = cacheBytes;
-          templateSource = "cache";
-        }
-      }
-    }
-
-    if (!workbookBytes) {
-      let response;
-      try {
-        response = await fetch(`재고조사표.xlsx?v=${Date.now()}`, { cache: "no-store" });
-      } catch (e) {
-        throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
-      }
-      if (!response.ok) throw new Error("서버에서 재고조사표 엑셀 템플릿을 읽어오는 데 실패했습니다.");
-
-      if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-      const arrayBuffer = await response.arrayBuffer();
-      if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
-      workbookBytes = new Uint8Array(arrayBuffer);
-    }
-
-    currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
-    
-    // 2. Supabase에서 재고 데이터만 조회 (엑셀 아카이브 대용량 제외 — 모바일 타임아웃 방지)
+    // 1. DB 재고 먼저 조회 (가벼움) — PC/모바일 시트 이름 확인용
     let dbRacks;
     try {
       dbRacks = await fetchInventoryRacksFromDb();
@@ -2216,8 +2223,49 @@ async function loadDataFromSupabase() {
           "\n모바일: Wi-Fi/데이터 연결, ⚙️ DB 설정(URL·Key)을 확인해 주세요."
       );
     }
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+
+    const inventoryRacks = getInventoryRacks(dbRacks);
+    const dbSheetNames = getDbSheetNames(dbRacks);
+
+    // 2. 업로드 엑셀 복원 (DB에 재고가 있으면 아카이브 우선 — B1 vs 셀 불일치 방지)
+    let templateSource = "bundled";
+    let workbookBytes = null;
+
+    const archived = await tryLoadArchivedWorkbookBytes();
+    if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+
+    if (archived) {
+      workbookBytes = archived.bytes;
+      templateSource = archived.source;
+    } else if (inventoryRacks.length === 0) {
+      try {
+        workbookBytes = await loadBundledWorkbookBytes();
+      } catch (e) {
+        throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+      }
+    } else {
+      try {
+        workbookBytes = await loadBundledWorkbookBytes();
+        templateSource = "bundled";
+      } catch (e) {
+        throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+      }
+    }
 
     if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
+
+    currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
+
+    let sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
+    if (sheetMismatch.length > 0 && templateSource === "bundled") {
+      const retryArchived = await tryLoadArchivedWorkbookBytes();
+      if (retryArchived) {
+        currentWorkbook = XLSX.read(retryArchived.bytes, { type: "array", cellStyles: true });
+        templateSource = retryArchived.source;
+        sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
+      }
+    }
 
     // 3. Supabase에서 최신 제품 메타데이터 조회
     let dbMeta, metaError;
@@ -2234,9 +2282,13 @@ async function loadDataFromSupabase() {
 
     if (loadToken !== supabaseLoadToken || isUserLocalWorkbook || isDbImportInProgress) return;
 
-    // 4. DB 데이터 반영 — 기본 템플릿이거나 재고 행이 있을 때만 셀 덮어쓰기
-    const inventoryRacks = getInventoryRacks(dbRacks);
-    if (templateSource === "bundled" || inventoryRacks.length > 0) {
+    // 4. DB 데이터 반영
+    if (templateSource === "bundled" && sheetMismatch.length > 0) {
+      productsMetadataCache = {};
+      (dbMeta || []).forEach((meta) => {
+        productsMetadataCache[meta.product_name] = meta;
+      });
+    } else if (templateSource === "bundled" || inventoryRacks.length > 0) {
       applyDbDataToWorkbook(dbRacks, dbMeta);
     } else {
       productsMetadataCache = {};
@@ -2249,20 +2301,35 @@ async function loadDataFromSupabase() {
       isUserLocalWorkbook = true;
     }
 
-    // 5. 가이드 숨기고 그리드 표시 영역 세팅
-    updateSheetDropdown(getWarehouseSheetNames(currentWorkbook));
+    // 5. 가이드 숨기고 그리드 표시
+    const wbSheetNames = getWarehouseSheetNames(currentWorkbook);
+    updateSheetDropdown(wbSheetNames);
     emptyGuide.style.display = "none";
     gridBoard.style.display = "grid";
     exportBtn.style.display = "inline-block";
 
-    const defaultSheet = resolveDefaultSheetName(currentWorkbook, getRememberedSheet());
+    const defaultSheet = resolveDefaultSheetName(
+      currentWorkbook,
+      getRememberedSheet(),
+      dbSheetNames
+    );
     sheetSelect.value = defaultSheet;
     renderActiveSheet(defaultSheet);
     rememberLastSheet(defaultSheet);
 
     const hasWorkbookArchive = templateSource !== "bundled";
 
-    if (templateSource === "storage" || templateSource === "db") {
+    if (sheetMismatch.length > 0 && templateSource === "bundled") {
+      syncStatusEl.textContent = `🟡 시트 불일치 (DB: ${sheetMismatch.slice(0, 2).join(", ")}) — PC에서 엑셀 재업로드`;
+      syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
+      syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
+      syncStatusEl.style.color = "#fbbf24";
+      if (isMobileViewport()) {
+        alert(
+          `PC와 모바일 도면이 다릅니다.\n\nDB 재고 시트: ${dbSheetNames.join(", ")}\n모바일 도면: ${wbSheetNames.join(", ")}\n\nPC에서 엑셀을 다시 업로드한 뒤 모바일에서 🔄 클라우드 동기화를 눌러 주세요.`
+        );
+      }
+    } else if (templateSource === "storage" || templateSource === "db") {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (업로드 엑셀 복원)";
       syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
       syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
@@ -2292,7 +2359,9 @@ async function loadDataFromSupabase() {
     updateSyncDiagnostics(
       inventoryRacks.length,
       hasWorkbookArchive,
-      templateSource
+      templateSource,
+      dbSheetNames,
+      wbSheetNames
     );
   } catch (err) {
     if (loadToken !== supabaseLoadToken) return;
@@ -2489,10 +2558,13 @@ async function importWorkbookToSupabase() {
 
     const workbookSaved = await persistUploadedWorkbook(currentWorkbook);
     if (!workbookSaved) {
-      syncStatusEl.textContent = "🟡 재고 동기화됨 (엑셀 파일 저장 실패 — PC에서 재업로드)";
+      syncStatusEl.textContent = "🟡 재고 동기화됨 — 엑셀 파일 DB 저장 실패 (모바일 불일치)";
       syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
       syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
       syncStatusEl.style.color = "#fbbf24";
+      alert(
+        "재고 데이터는 DB에 저장됐지만, 엑셀 도면 파일 저장에 실패했습니다.\n모바일에서 PC와 다른 화면이 보일 수 있습니다.\n\n엑셀을 한 번 더 업로드해 주세요."
+      );
     }
   } catch (err) {
     alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
