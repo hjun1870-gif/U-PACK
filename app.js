@@ -139,6 +139,8 @@ const WORKBOOK_IDB_KEY = "current";
 const WORKBOOK_STORAGE_BUCKET = "workbooks";
 const WORKBOOK_STORAGE_PATH = "latest.xlsx";
 const WORKBOOK_SNAPSHOT_ID = "latest";
+const WORKBOOK_ARCHIVE_SHEET = "__WORKBOOK__";
+const WORKBOOK_CHUNK_SIZE = 45000;
 const LAST_SHEET_KEY = "last_sheet_name";
 
 function uint8ArrayToBase64(bytes) {
@@ -249,18 +251,32 @@ async function uploadWorkbookToDbSnapshot(workbook) {
   if (!supabaseClient || !workbook) return false;
   try {
     const bytes = workbookToBytes(workbook);
-    const file_base64 = uint8ArrayToBase64(bytes);
-    const { error } = await supabaseClient
-      .from("workbook_snapshot")
-      .upsert(
-        {
-          id: WORKBOOK_SNAPSHOT_ID,
-          file_base64,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "id" }
-      );
-    if (error) throw error;
+    const base64 = uint8ArrayToBase64(bytes);
+    const chunks = [];
+    for (let i = 0; i < base64.length; i += WORKBOOK_CHUNK_SIZE) {
+      chunks.push(base64.slice(i, i + WORKBOOK_CHUNK_SIZE));
+    }
+
+    await supabaseClient
+      .from("rack_inventory")
+      .delete()
+      .eq("sheet_name", WORKBOOK_ARCHIVE_SHEET);
+
+    const rows = chunks.map((chunk, index) => ({
+      sheet_name: WORKBOOK_ARCHIVE_SHEET,
+      rack_row: index + 1,
+      rack_col: 0,
+      product_name: chunk,
+      pallet_qty: chunks.length,
+      box_qty: base64.length,
+    }));
+
+    for (let i = 0; i < rows.length; i += 50) {
+      const { error } = await supabaseClient
+        .from("rack_inventory")
+        .insert(rows.slice(i, i + 50));
+      if (error) throw error;
+    }
     return true;
   } catch (e) {
     console.warn("Supabase DB 워크북 저장 실패:", e);
@@ -272,12 +288,13 @@ async function downloadWorkbookBytesFromDbSnapshot() {
   if (!supabaseClient) return null;
   try {
     const { data, error } = await supabaseClient
-      .from("workbook_snapshot")
-      .select("file_base64")
-      .eq("id", WORKBOOK_SNAPSHOT_ID)
-      .maybeSingle();
-    if (error || !data?.file_base64) return null;
-    return base64ToUint8Array(data.file_base64);
+      .from("rack_inventory")
+      .select("rack_row, product_name")
+      .eq("sheet_name", WORKBOOK_ARCHIVE_SHEET)
+      .order("rack_row", { ascending: true });
+    if (error || !data?.length) return null;
+    const base64 = data.map((row) => row.product_name).join("");
+    return base64ToUint8Array(base64);
   } catch (e) {
     console.warn("Supabase DB 워크북 로드 실패:", e);
     return null;
@@ -2218,8 +2235,10 @@ function applyDbDataToWorkbook(dbRacks, dbMeta) {
     }
   });
 
-  // DB 랙 데이터를 엑셀 메모리에 덮어쓰기
-  dbRacks.forEach((rack) => {
+  // DB 랙 데이터를 엑셀 메모리에 덮어쓰기 (워크북 아카이브 행 제외)
+  dbRacks
+    .filter((rack) => rack.sheet_name !== WORKBOOK_ARCHIVE_SHEET)
+    .forEach((rack) => {
     const sheet = currentWorkbook.Sheets[rack.sheet_name];
     if (!sheet) return;
     const colMapping = detectColumnMapping(sheet);
