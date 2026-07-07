@@ -20,6 +20,74 @@ let isUserLocalWorkbook = false; // 사용자가 업로드한 엑셀이 우선 (
 let supabaseLoadToken = 0; // 진행 중인 Supabase 로드 취소용 토큰
 let isDbImportInProgress = false; // DB 일괄 덮어쓰기 중 realtime/서버로드 차단
 
+/** 모바일·태블릿 뷰포트 여부 */
+function isMobileViewport() {
+  return window.matchMedia("(max-width: 768px)").matches;
+}
+
+/** 모바일에서 가로 스크롤이 자연스럽게 되도록 격자 최소 너비 적용 */
+function applyResponsiveGridLayout(totalCols) {
+  if (!gridBoard) return;
+  if (isMobileViewport()) {
+    const minWidth = Math.max(920, 80 + totalCols * 58 + 50);
+    gridBoard.style.width = `${minWidth}px`;
+    gridBoard.style.maxWidth = "none";
+  } else {
+    gridBoard.style.width = "";
+  }
+}
+
+/**
+ * 랙 셀 터치/클릭 — 스크롤과 탭을 구분해 모바일에서도 편집 모달이 열리게 함
+ */
+function bindRackCellTap(cell, onActivate) {
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let touchMoved = false;
+  let lastTouchEnd = 0;
+
+  cell.addEventListener(
+    "touchstart",
+    (e) => {
+      touchMoved = false;
+      const t = e.touches[0];
+      touchStartX = t.clientX;
+      touchStartY = t.clientY;
+    },
+    { passive: true }
+  );
+
+  cell.addEventListener(
+    "touchmove",
+    (e) => {
+      const t = e.touches[0];
+      if (
+        Math.abs(t.clientX - touchStartX) > 12 ||
+        Math.abs(t.clientY - touchStartY) > 12
+      ) {
+        touchMoved = true;
+      }
+    },
+    { passive: true }
+  );
+
+  cell.addEventListener(
+    "touchend",
+    (e) => {
+      if (touchMoved) return;
+      e.preventDefault();
+      lastTouchEnd = Date.now();
+      onActivate();
+    },
+    { passive: false }
+  );
+
+  cell.addEventListener("click", () => {
+    if (Date.now() - lastTouchEnd < 400) return;
+    onActivate();
+  });
+}
+
 // DOM 요소 캐싱
 const fileInput = document.getElementById("fileInput");
 const demoBtn = document.getElementById("demoBtn");
@@ -56,6 +124,14 @@ const inputDbKey = document.getElementById("inputDbKey");
 const disconnectDbBtn = document.getElementById("disconnectDbBtn");
 const saveDbConfigBtn = document.getElementById("saveDbConfigBtn");
 const syncStatusEl = document.getElementById("syncStatus");
+const mobileScrollHint = document.getElementById("mobileScrollHint");
+const autoSyncOnUploadInput = document.getElementById("autoSyncOnUpload");
+
+/** 엑셀 업로드 시 Supabase 자동 동기화 여부 (기본값: 켜짐) */
+function isAutoSyncOnUploadEnabled() {
+  const stored = localStorage.getItem("auto_sync_on_upload");
+  return stored === null || stored === "true";
+}
 
 /**
  * 1. 이벤트 리스너 등록
@@ -86,6 +162,14 @@ disconnectDbBtn.addEventListener("click", disconnectDb);
 window.addEventListener("click", (e) => {
   if (e.target === dbConfigModal) hideDbModal();
 });
+if (autoSyncOnUploadInput) {
+  autoSyncOnUploadInput.addEventListener("change", () => {
+    localStorage.setItem(
+      "auto_sync_on_upload",
+      autoSyncOnUploadInput.checked ? "true" : "false"
+    );
+  });
+}
 
 // 검색창 외부 영역 클릭 시 검색 결과 래퍼 닫기
 document.addEventListener("click", (e) => {
@@ -297,12 +381,10 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   sheetSelect.value = defaultSheet;
   renderActiveSheet(defaultSheet);
 
-  if (isOnline) {
-    // 렌더링 완료 후 DB 덮어쓰기 확인 (확인창이 UI 갱신을 막지 않도록 분리)
+  if (isOnline && fromUserUpload && isAutoSyncOnUploadEnabled()) {
+    // 렌더링 완료 후 DB에 자동 동기화 (확인창 없이 백그라운드 진행)
     setTimeout(() => {
-      if (confirm("실시간 동기화(Supabase)가 활성화되어 있습니다. 업로드한 엑셀 파일 데이터로 데이터베이스를 덮어쓰시겠습니까?")) {
-        importWorkbookToSupabase();
-      }
+      importWorkbookToSupabase();
     }, 0);
   }
 }
@@ -691,7 +773,10 @@ function renderActiveSheet(sheetName) {
 
   // CSS Grid 컬럼·행 — 업로드된 시트의 실제 랙/행 수에 맞춰 동적 구성
   gridBoard.style.gridTemplateColumns = `40px repeat(${leftCols}, minmax(52px, 1fr)) 50px repeat(${rightCols}, minmax(52px, 1fr)) 40px`;
-  gridBoard.style.maxWidth = totalCols <= 14 ? "1100px" : totalCols <= 16 ? "1250px" : "1400px";
+  if (!isMobileViewport()) {
+    gridBoard.style.maxWidth = totalCols <= 14 ? "1100px" : totalCols <= 16 ? "1250px" : "1400px";
+  }
+  applyResponsiveGridLayout(totalCols);
   gridBoard.dataset.sheetName = sheetName;
   gridBoard.dataset.layout = `${leftCols}+${rightCols}x${maxRows}`;
 
@@ -784,6 +869,10 @@ function renderActiveSheet(sheetName) {
   totalProductsEl.textContent = totalProducts;
   totalPalletsEl.textContent = totalPallets;
   totalBoxesEl.textContent = totalBoxes;
+
+  if (mobileScrollHint) {
+    mobileScrollHint.style.display = isMobileViewport() ? "block" : "none";
+  }
 }
 
 /**
@@ -895,8 +984,7 @@ function createRackCellElement(row, col, cellData, rackNo, zoneClass = "") {
 
   cell.appendChild(qtyContainer);
 
-  // 셀 클릭 이벤트 바인딩 -> 수정 모달 띄우기
-  cell.addEventListener("click", () => {
+  bindRackCellTap(cell, () => {
     showEditModal(row, col, cellData, rackNo);
   });
 
@@ -1146,11 +1234,19 @@ function showEditModal(row, col, cellData, rackNo) {
   inputBox.value = cellData.box || 0;
 
   editModal.classList.add("show");
-  inputProduct.focus();
+  document.body.classList.add("modal-open");
+  if (isMobileViewport()) {
+    requestAnimationFrame(() => {
+      editModal.querySelector(".modal-container")?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  } else {
+    inputProduct.focus();
+  }
 }
 
 function hideModal() {
   editModal.classList.remove("show");
+  document.body.classList.remove("modal-open");
   selectedCellInfo = null;
 }
 
@@ -2031,8 +2127,10 @@ async function importWorkbookToSupabase() {
       renderActiveSheet(currentSheetName);
     }
 
-    syncStatusEl.textContent = "🟢 DB 동기화 완료 (로컬 엑셀 유지)";
-    alert("로컬 엑셀 데이터가 Supabase DB에 백업되었습니다.\n화면은 업로드한 엑셀 기준으로 유지됩니다.");
+    syncStatusEl.textContent = "🟢 업로드 → DB 자동 동기화 완료";
+    syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
+    syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+    syncStatusEl.style.color = "#10b981";
   } catch (err) {
     alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
     console.error(err);
@@ -2040,7 +2138,8 @@ async function importWorkbookToSupabase() {
   } finally {
     isDbImportInProgress = false;
     isUserLocalWorkbook = true;
-    // 로컬 업로드 우선 모드에서는 realtime이 서버 템플릿으로 덮어쓰지 않도록 구독하지 않음
+    // 서버 템플릿 재로드는 막되, 셀 단위 실시간 변경은 PC·모바일 간 수신
+    subscribeToRealtime();
   }
 }
 
@@ -2055,7 +2154,7 @@ function pauseRealtimeSync() {
 }
 
 function subscribeToRealtime() {
-  if (!isOnline || !supabaseClient || isUserLocalWorkbook) return;
+  if (!isOnline || !supabaseClient || isDbImportInProgress) return;
 
   pauseRealtimeSync();
 
@@ -2069,7 +2168,7 @@ function subscribeToRealtime() {
 
 // 실시간 기기 변경에 대한 수신 처리기
 function handleRealtimeRackChange(payload) {
-  if (isUserLocalWorkbook || isDbImportInProgress) return;
+  if (isDbImportInProgress) return;
   if (!currentWorkbook) return;
 
   const { eventType, new: newRow, old: oldRow } = payload;
@@ -2128,6 +2227,9 @@ function handleRealtimeRackChange(payload) {
 function showDbModal() {
   inputDbUrl.value = window.SUPABASE_URL || localStorage.getItem("supabase_url") || "";
   inputDbKey.value = window.SUPABASE_ANON_KEY || localStorage.getItem("supabase_anon_key") || "";
+  if (autoSyncOnUploadInput) {
+    autoSyncOnUploadInput.checked = isAutoSyncOnUploadEnabled();
+  }
   dbConfigModal.classList.add("show");
 }
 
@@ -2146,6 +2248,9 @@ function saveDbConfig() {
   
   localStorage.setItem("supabase_url", url);
   localStorage.setItem("supabase_anon_key", key);
+  if (autoSyncOnUploadInput) {
+    localStorage.setItem("auto_sync_on_upload", autoSyncOnUploadInput.checked ? "true" : "false");
+  }
   hideDbModal();
   alert("설정이 저장되었습니다! 실시간 동기화를 위해 동적 연결을 활성화합니다.");
   window.location.reload();
@@ -2162,4 +2267,14 @@ function disconnectDb() {
 }
 
 // 앱 구동 시 자동 데이터베이스 초기화 진행
+window.addEventListener("resize", () => {
+  if (currentSheetName && gridBoard.style.display !== "none") {
+    const layout = gridBoard.dataset.layout || "";
+    const colMatch = layout.match(/^(\d+)\+(\d+)/);
+    if (colMatch) {
+      applyResponsiveGridLayout(parseInt(colMatch[1], 10) + parseInt(colMatch[2], 10));
+    }
+  }
+});
+
 initSupabase();

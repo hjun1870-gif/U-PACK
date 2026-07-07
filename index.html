@@ -2,7 +2,10 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>창고 재고조사표 시각화 및 관리 시스템</title>
   <!-- SEO 메타태그 설정 -->
   <meta name="description" content="엑셀 기반의 창고 재고 데이터를 시각적인 랙(Rack) 레이아웃으로 변환하고 직관적으로 수정을 돕는 웹 애플리케이션입니다.">
@@ -22,13 +25,13 @@
     <header>
       <div class="brand-section">
         <h1>창고 재고조사표 시각화 시스템</h1>
-        <p>B2, B1, B3 등 창고 도면을 격자로 시각화하고 마우스 클릭으로 재고를 관리합니다.</p>
+        <p>창고 도면을 격자로 시각화하고, PC·스마트폰에서 터치로 재고를 조회·수정합니다.</p>
       </div>
 
       <!-- 컨트롤 바: 파일 업로드, 시트 변경, 검색, 다운로드 -->
       <div class="controls-section">
         <!-- 동기화 상태 표시 배지 -->
-        <span id="syncStatus" class="sync-badge offline" style="padding: 0.6rem 1rem; font-size: 0.85rem; font-weight: 600; border-radius: 6px; display: inline-flex; align-items: center; gap: 0.3rem;">오프라인 모드</span>
+        <span id="syncStatus" class="sync-badge offline">오프라인 모드</span>
         
         <!-- 엑셀 파일 로드 버튼 및 데모 로드 버튼 -->
         <div class="file-upload-wrapper">
@@ -90,6 +93,9 @@
 
     <!-- 메인 대시보드 레이아웃 보드 판 -->
     <main class="board-wrapper">
+      <p id="mobileScrollHint" class="board-scroll-hint" style="display: none;" aria-hidden="true">
+        ← 좌우로 밀어 전체 도면 확인 · 랙을 탭하면 수정 →
+      </p>
       
       <!-- 엑셀 파일 로드 전 나타나는 빈 파일 가이드 영역 -->
       <div id="emptyGuide" class="empty-guide">
@@ -104,16 +110,26 @@
         <h2>재고조사표 엑셀 파일을 업로드해 주세요</h2>
         <p>상단의 '엑셀 파일 업로드' 버튼을 누르거나 파일을 드래그 앤 드롭하면 창고 도면이 즉시 렌더링됩니다.</p>
         
-        <!-- 모바일 무선 연동 안내 박스 -->
+        <!-- 모바일 접속 및 동기화 안내 -->
         <div class="mobile-guide-box" style="margin-top: 1.8rem; padding: 1.2rem; background: rgba(6, 182, 212, 0.05); border: 1px dashed rgba(6, 182, 212, 0.3); border-radius: 10px; font-size: 0.85rem; max-width: 550px; text-align: left; line-height: 1.5; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);">
           <h4 style="color: var(--accent-cyan); margin-bottom: 0.5rem; font-weight: 700; display: flex; align-items: center; gap: 0.4rem;">
-            📱 스마트폰 / 태블릿으로 접속 및 수정하는 방법
+            📱 스마트폰에서 조회·수정하기
           </h4>
+          <p style="color: var(--text-muted); margin-bottom: 0.75rem;">
+            <strong style="color: var(--text-main);">방법 1 (권장)</strong> — 인터넷만 있으면 어디서나 접속
+          </p>
+          <ol style="margin-left: 1.2rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 1rem;">
+            <li>스마트폰 브라우저에서 <a href="https://hjun1870-gif.github.io/U-PACK/" style="color: var(--accent-cyan); word-break: break-all;">https://hjun1870-gif.github.io/U-PACK/</a> 를 엽니다.</li>
+            <li>상단 <strong>⚙️ DB 설정</strong>에서 PC와 동일한 Supabase URL·Anon Key를 입력합니다.</li>
+            <li>PC에서 엑셀을 업로드하면 DB에 <strong>자동 동기화</strong>됩니다. 모바일에서 바로 확인·수정할 수 있습니다.</li>
+          </ol>
+          <p style="color: var(--text-muted); margin-bottom: 0.5rem;">
+            <strong style="color: var(--text-main);">방법 2</strong> — 같은 Wi-Fi (로컬 PC 서버)
+          </p>
           <ol style="margin-left: 1.2rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.3rem;">
-            <li>PC와 모바일 기기를 <strong>동일한 Wi-Fi 공유기</strong>에 연결합니다.</li>
-            <li>PC의 명령 프롬프트(cmd) 등에서 <code>ipconfig</code>를 입력하여 PC의 <strong>로컬 IP 주소</strong>(예: <code>192.168.x.x</code>)를 파악합니다.</li>
-            <li>스마트폰 브라우저 주소창에 <code>http://[확인한 PC 로컬 IP 주소]:8010/index.html</code>를 입력해 접속합니다.</li>
-            <li>손가락으로 도면을 드래그하며 랙을 터치하면, 모바일 터치 패널로 간편하게 재고를 조회하고 수정할 수 있습니다.</li>
+            <li>PC와 모바일을 <strong>동일 Wi-Fi</strong>에 연결합니다.</li>
+            <li>PC에서 <code>ipconfig</code>로 로컬 IP(예: 192.168.x.x)를 확인합니다.</li>
+            <li>모바일에서 <code>http://[PC IP]:8010/index.html</code> 로 접속합니다.</li>
           </ol>
         </div>
       </div>
@@ -151,12 +167,12 @@
           <!-- 파렛트(P) 입력 폼 -->
           <div class="form-group">
             <label for="inputPallet">파렛트 수량 (P)</label>
-            <input type="number" id="inputPallet" class="form-control" min="0" value="0">
+            <input type="number" id="inputPallet" class="form-control" min="0" value="0" inputmode="numeric" pattern="[0-9]*">
           </div>
           <!-- 박스(B) 입력 폼 -->
           <div class="form-group">
             <label for="inputBox">박스 수량 (B)</label>
-            <input type="number" id="inputBox" class="form-control" min="0" value="0">
+            <input type="number" id="inputBox" class="form-control" min="0" value="0" inputmode="numeric" pattern="[0-9]*">
           </div>
         </div>
 
@@ -194,6 +210,12 @@
           <label for="inputDbKey">Supabase Anon Key</label>
           <input type="text" id="inputDbKey" class="form-control" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
         </div>
+
+        <label class="auto-sync-option" for="autoSyncOnUpload">
+          <input type="checkbox" id="autoSyncOnUpload" checked>
+          <span>엑셀 업로드 시 DB에 자동 동기화 (PC·모바일 연동)</span>
+        </label>
+        <p class="auto-sync-hint">켜두면 업로드한 엑셀 데이터가 Supabase에 자동 반영되어, 모바일에서도 바로 확인·수정할 수 있습니다.</p>
       </div>
 
       <div class="modal-actions">
@@ -208,6 +230,6 @@
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="config.js" defer></script>
   <!-- 애플리케이션 비즈니스 로직 스크립트 연결 -->
-  <script src="app.js?v=20260705a"></script>
+  <script src="app.js?v=20260707b"></script>
 </body>
 </html>

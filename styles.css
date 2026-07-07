@@ -35,8 +35,16 @@ body {
   background: linear-gradient(135deg, var(--bg-gradient-start), var(--bg-gradient-end));
   color: var(--text-main);
   min-height: 100vh;
+  min-height: 100dvh;
   padding: 2rem;
+  padding-left: max(2rem, env(safe-area-inset-left));
+  padding-right: max(2rem, env(safe-area-inset-right));
   overflow-x: hidden;
+  touch-action: manipulation;
+}
+
+body.modal-open {
+  overflow: hidden;
 }
 
 /* 스크롤바 커스터마이징 */
@@ -241,6 +249,47 @@ header {
   color: var(--accent-cyan);
 }
 
+/* 동기화 상태 배지 */
+.sync-badge {
+  padding: 0.6rem 1rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+.sync-badge.offline {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-muted);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.sync-badge.online {
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--accent-green);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.sync-badge.syncing {
+  background: rgba(6, 182, 212, 0.12);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(6, 182, 212, 0.35);
+}
+
+/* 모바일 가로 스크롤 안내 */
+.board-scroll-hint {
+  width: 100%;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--accent-cyan);
+  padding: 0.35rem 0.5rem 0.75rem;
+  font-weight: 600;
+  opacity: 0.9;
+}
+
 /* 메인 대시보드 레이아웃 보드 */
 .board-wrapper {
   background: var(--card-bg);
@@ -345,6 +394,9 @@ header {
   transition: all 0.2s ease;
   position: relative;
   overflow: hidden;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
 }
 
 .rack-cell:hover {
@@ -570,6 +622,32 @@ header {
   border-color: var(--accent-cyan);
 }
 
+.auto-sync-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--text-main);
+  margin-top: 0.25rem;
+}
+
+.auto-sync-option input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin-top: 0.15rem;
+  accent-color: var(--accent-cyan);
+  flex-shrink: 0;
+}
+
+.auto-sync-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin-top: 0.5rem;
+  padding-left: 1.65rem;
+}
+
 .qty-inputs-row {
   display: flex;
   gap: 1rem;
@@ -644,7 +722,7 @@ header {
    ========================================================================== */
 @media (max-width: 768px) {
   body {
-    padding: 1rem 0.5rem;
+    padding: 1rem max(0.5rem, env(safe-area-inset-right)) 1rem max(0.5rem, env(safe-area-inset-left));
   }
 
   header {
@@ -677,15 +755,25 @@ header {
   .sheet-select, 
   .search-input, 
   .export-btn, 
-  #demoBtn {
+  #demoBtn,
+  #dbConfigBtn,
+  #syncStatus {
     width: 100% !important;
+  }
+
+  #syncStatus {
+    justify-content: center;
+    white-space: normal;
+    text-align: center;
+    min-height: 48px;
   }
 
   .file-upload-btn, 
   .sheet-select, 
   .search-input, 
   .export-btn, 
-  #demoBtn {
+  #demoBtn,
+  #dbConfigBtn {
     padding: 0.8rem 1rem;
     font-size: 0.95rem;
     height: 48px; /* 터치 영역 최소 규격 준수 */
@@ -736,14 +824,9 @@ header {
     -webkit-overflow-scrolling: touch; /* iOS 터치 관성 스크롤 적용 */
   }
 
-  /* 격자가 찌그러지지 않고 모바일에서도 또렷하게 보이도록 고정 해상도 1200px 설정 */
+  /* 격자 min-width는 app.js에서 시트 열 수에 맞게 동적 설정 */
   .grid-board {
-    width: 1200px;
-    max-width: none;
-  }
-
-  .grid-board {
-    grid-auto-rows: 55px; /* 약간 콤팩트하게 높이 축소 */
+    grid-auto-rows: 55px;
     gap: 3px;
   }
 
@@ -756,6 +839,27 @@ header {
     background-color: rgba(6, 182, 212, 0.25) !important;
     border-color: var(--accent-cyan);
     transform: scale(0.98);
+  }
+
+  .rack-cell:hover {
+    transform: none;
+  }
+
+  .search-results-wrap {
+    padding: 0 0.5rem 0.5rem;
+  }
+
+  .search-result-item {
+    padding: 0.85rem 1rem;
+    min-height: 48px;
+  }
+
+  .close-btn {
+    min-width: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   /* 모달 팝업의 모바일 최적화 */
