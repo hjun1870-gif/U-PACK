@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>창고 재고조사표 시각화 및 관리 시스템</title>
+  <!-- SEO 메타태그 설정 -->
+  <meta name="description" content="엑셀 기반의 창고 재고 데이터를 시각적인 랙(Rack) 레이아웃으로 변환하고 직관적으로 수정을 돕는 웹 애플리케이션입니다.">
+  
+  <!-- 디자인 스타일시트 연결 -->
+  <link rel="stylesheet" href="styles.css?v=20260708n">
+  
+  <!-- 외부 엑셀 파싱 및 스타일 라이브러리 (xlsx-js-style) CDN 로드 -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+</head>
+<body>
+
+  <!-- 전체 애플리케이션 레이아웃 컨테이너 -->
+  <div class="app-container">
+    
+    <!-- 상단 헤더: 타이틀 정보 및 컨트롤 조작부 -->
+    <header>
+      <div class="brand-section">
+        <h1>창고 재고조사표 시각화 시스템</h1>
+        <p>창고 도면을 격자로 시각화하고, PC·스마트폰에서 터치로 재고를 조회·수정합니다.</p>
+      </div>
+
+      <!-- 컨트롤 바: 파일 업로드, 시트 변경, 검색, 다운로드 -->
+      <div class="controls-section">
+        <!-- 동기화 상태 표시 배지 -->
+        <span id="syncStatus" class="sync-badge offline">오프라인 모드</span>
+        
+        <!-- 엑셀 파일 로드 버튼 및 데모 로드 버튼 -->
+        <div class="file-upload-wrapper">
+          <button class="file-upload-btn">엑셀 파일 업로드</button>
+          <input type="file" id="fileInput" class="file-upload-input" accept=".xlsx, .xls">
+        </div>
+        <button id="demoBtn" class="btn-secondary" style="padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600;">데모 데이터 불러오기</button>
+        <button id="cloudSyncBtn" class="btn-secondary" style="padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600;">🔄 클라우드 동기화</button>
+        <button id="dbConfigBtn" class="btn-secondary" style="padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600; background: rgba(6, 182, 212, 0.05); border: 1px solid rgba(6, 182, 212, 0.4); color: #06b6d4;">⚙️ DB 설정</button>
+
+        <!-- 시트 선택 드롭다운 -->
+        <div class="select-wrapper">
+          <label for="sheetSelect">구역(시트):</label>
+          <select id="sheetSelect" class="sheet-select">
+            <option value="">파일을 먼저 업로드하세요</option>
+          </select>
+        </div>
+
+        <!-- 랙 표시 필터 -->
+        <div class="rack-filter-group" id="rackFilterGroup" style="display: none;">
+          <label>표시:</label>
+          <button type="button" class="rack-filter-btn active" data-filter="all">전체</button>
+          <button type="button" class="rack-filter-btn" data-filter="stocked">재고 있음</button>
+          <button type="button" class="rack-filter-btn" data-filter="empty">빈 랙</button>
+        </div>
+
+        <button id="undoBtn" type="button" class="btn-secondary undo-btn" style="display: none;" title="Ctrl+Z">↩ 실행 취소</button>
+
+        <!-- 실시간 재고 검색 기능 -->
+        <div class="search-wrapper">
+          <!-- 돋보기 아이콘 SVG -->
+          <span class="search-icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+          </span>
+          <input type="text" id="searchInput" class="search-input" placeholder="제품명 검색 (예: PP300)..." autocomplete="off" aria-autocomplete="list" aria-controls="searchAutocomplete" aria-expanded="false">
+          <ul id="searchAutocomplete" class="search-autocomplete" role="listbox" style="display: none;"></ul>
+        </div>
+
+        <!-- 수정본 엑셀 내보내기 버튼 (기본은 비활성화 상태) -->
+        <button id="exportBtn" class="export-btn" style="display: none;">수정된 엑셀 다운로드</button>
+      </div>
+    </header>
+
+    <!-- 검색 결과 드롭다운 영역: 헤더 바깥, 창고 도면 위에 독립 배치하여 겹침 완전 방지 -->
+    <div id="searchResultsWrap" class="search-results-wrap" style="display: none;">
+      <div class="search-nav-bar" id="searchNavBar" style="display: none;">
+        <button type="button" id="searchPrevBtn">◀ 이전</button>
+        <span id="searchNavLabel" class="search-nav-label">0 / 0</span>
+        <button type="button" id="searchNextBtn">다음 ▶</button>
+      </div>
+      <div id="searchResults" class="search-results-panel"></div>
+    </div>
+
+    <!-- 요약 통계 정보 표시 바 -->
+    <div class="summary-bar">
+      <div class="summary-item">
+        <span class="label">적재 품목 수:</span>
+        <span id="totalProducts" class="value">0</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">총 파렛트(P) 수량:</span>
+        <span id="totalPallets" class="value">0</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">총 박스(B) 수량:</span>
+        <span id="totalBoxes" class="value">0</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">도면 규격:</span>
+        <span id="layoutInfo" class="value">-</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">구역 점유율:</span>
+        <span id="occupancyRate" class="value">-</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">TOTAL↔창고:</span>
+        <span id="totalMatchStatus" class="value">-</span>
+      </div>
+      <div class="summary-item sync-diagnostics-item" style="flex: 1 1 100%;">
+        <span id="syncDiagnostics" class="label" style="color: var(--text-muted); font-size: 0.8rem;">DB 연결 상태 확인 중...</span>
+      </div>
+    </div>
+
+    <!-- 메인 대시보드 레이아웃 보드 판 -->
+    <main class="board-wrapper">
+      <p id="mobileScrollHint" class="board-scroll-hint" style="display: none;" aria-hidden="true">
+        ← 좌우로 밀어 전체 도면 확인 · 랙을 탭하면 수정 →
+      </p>
+      
+      <!-- 엑셀 파일 로드 전 나타나는 빈 파일 가이드 영역 -->
+      <div id="emptyGuide" class="empty-guide">
+        <!-- 엑셀 서류 아이콘 SVG -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="16" y1="13" x2="8" y2="13"></line>
+          <line x1="16" y1="17" x2="8" y2="17"></line>
+          <polyline points="10 9 9 9 8 9"></polyline>
+        </svg>
+        <h2>재고조사표 엑셀 파일을 업로드해 주세요</h2>
+        <p>상단의 '엑셀 파일 업로드' 버튼을 누르거나 파일을 드래그 앤 드롭하면 창고 도면이 즉시 렌더링됩니다.</p>
+        
+        <!-- 모바일 접속 및 동기화 안내 -->
+        <div class="mobile-guide-box" style="margin-top: 1.8rem; padding: 1.2rem; background: rgba(6, 182, 212, 0.05); border: 1px dashed rgba(6, 182, 212, 0.3); border-radius: 10px; font-size: 0.85rem; max-width: 550px; text-align: left; line-height: 1.5; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);">
+          <h4 style="color: var(--accent-cyan); margin-bottom: 0.5rem; font-weight: 700; display: flex; align-items: center; gap: 0.4rem;">
+            📱 스마트폰에서 조회·수정하기
+          </h4>
+          <p style="color: var(--text-muted); margin-bottom: 0.75rem;">
+            <strong style="color: var(--text-main);">방법 1 (권장)</strong> — 인터넷만 있으면 어디서나 접속
+          </p>
+          <ol style="margin-left: 1.2rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 1rem;">
+            <li>스마트폰 브라우저에서 <a href="https://hjun1870-gif.github.io/U-PACK/" style="color: var(--accent-cyan); word-break: break-all;">https://hjun1870-gif.github.io/U-PACK/</a> 를 엽니다.</li>
+            <li>상단 <strong>⚙️ DB 설정</strong>에서 PC와 동일한 Supabase URL·Anon Key를 입력합니다.</li>
+            <li>PC에서 엑셀을 업로드하면 DB에 <strong>자동 동기화</strong>됩니다. 모바일에서 새로고침하면 같은 도면이 복원됩니다.</li>
+            <li>상단 상태가 <strong>「업로드 엑셀 복원」</strong>이면 정상입니다. <strong>「기본 도면」</strong>이면 PC에서 엑셀을 한 번 더 업로드해 주세요. (별도 SQL 설정 불필요)</li>
+          </ol>
+          <p style="color: var(--text-muted); margin-bottom: 0.5rem;">
+            <strong style="color: var(--text-main);">방법 2</strong> — 같은 Wi-Fi (로컬 PC 서버)
+          </p>
+          <ol style="margin-left: 1.2rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.3rem;">
+            <li>PC와 모바일을 <strong>동일 Wi-Fi</strong>에 연결합니다.</li>
+            <li>PC에서 <code>ipconfig</code>로 로컬 IP(예: 192.168.x.x)를 확인합니다.</li>
+            <li>모바일에서 <code>http://[PC IP]:8010/index.html</code> 로 접속합니다.</li>
+          </ol>
+        </div>
+      </div>
+
+      <!-- 업로드된 엑셀 시트 구조에 맞춰 동적으로 렌더링되는 창고 도면 -->
+      <div id="gridBoard" class="grid-board" style="display: none;">
+        <!-- JavaScript(app.js)를 통해 격자 셀이 동적으로 채워집니다. -->
+      </div>
+      
+    </main>
+
+  </div>
+
+  <!-- 상세 편집 모달 다이얼로그 (Overlay) -->
+  <div id="editModal" class="modal-overlay">
+    <div class="modal-container">
+      
+      <!-- 모달 상단 헤더 -->
+      <div class="modal-header">
+        <h3 id="modalCellTitle" class="modal-title">재고 상세 수정</h3>
+        <button id="closeModal" class="close-btn">&times;</button>
+      </div>
+
+      <!-- 모달 입력 본문 -->
+      <div class="modal-body">
+        
+        <!-- 제품명 입력 폼 -->
+        <div class="form-group">
+          <label for="inputProduct">제품명</label>
+          <input type="text" id="inputProduct" class="form-control" placeholder="비워두면 재고 없음 처리">
+        </div>
+
+        <!-- 수량 입력 영역 (P, B 가로 정렬) -->
+        <div class="qty-inputs-row">
+          <!-- 파렛트(P) 입력 폼 -->
+          <div class="form-group">
+            <label for="inputPallet">파렛트 수량 (P)</label>
+            <input type="number" id="inputPallet" class="form-control" min="0" value="0" inputmode="numeric" pattern="[0-9]*">
+          </div>
+          <!-- 박스(B) 입력 폼 -->
+          <div class="form-group">
+            <label for="inputBox">박스 수량 (B)</label>
+            <input type="number" id="inputBox" class="form-control" min="0" value="0" inputmode="numeric" pattern="[0-9]*">
+          </div>
+        </div>
+
+      </div>
+
+      <!-- 모달 하단 버튼 버튼 영역 -->
+      <div class="modal-actions">
+        <button id="moveBtn" type="button" class="btn-secondary" style="margin-right: auto;">다른 랙으로 이동</button>
+        <button id="deleteBtn" type="button" class="btn-danger">삭제하기</button>
+        <button id="cancelBtn" type="button" class="btn-secondary">취소</button>
+        <button id="saveBtn" type="button" class="btn-primary">저장하기</button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- DB 설정 모달 다이얼로그 (Overlay) -->
+  <div id="dbConfigModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 480px;">
+      
+      <div class="modal-header">
+        <h3 class="modal-title">⚙️ Supabase 실시간 동기화 설정</h3>
+        <button id="closeDbModal" class="close-btn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 1rem;">
+          Supabase 프로젝트 정보를 기입하면 PC와 모바일 간 실시간으로 데이터가 연동됩니다.
+          <strong style="color: var(--accent-cyan);">모바일은 PC와 동일한 URL·Key를 직접 입력</strong>해야 합니다. (PC 설정이 자동 공유되지 않습니다)
+        </p>
+        
+        <div class="form-group">
+          <label for="inputDbUrl">Supabase Project URL</label>
+          <input type="text" id="inputDbUrl" class="form-control" placeholder="https://your-project.supabase.co">
+        </div>
+
+        <div class="form-group">
+          <label for="inputDbKey">Supabase Anon Key</label>
+          <input type="text" id="inputDbKey" class="form-control" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
+        </div>
+
+        <label class="auto-sync-option" for="autoSyncOnUpload">
+          <input type="checkbox" id="autoSyncOnUpload" checked>
+          <span>엑셀 업로드 시 DB에 자동 동기화 (PC·모바일 연동)</span>
+        </label>
+        <p class="auto-sync-hint">켜두면 업로드한 엑셀 데이터가 Supabase에 자동 반영되어, 모바일에서도 바로 확인·수정할 수 있습니다.</p>
+      </div>
+
+      <div class="modal-actions">
+        <button id="disconnectDbBtn" class="btn-secondary" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); color: #ef4444;">연동 해제</button>
+        <button id="saveDbConfigBtn" class="btn-primary">연동 완료</button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- 재고 이동 모달 -->
+  <div id="moveModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3 class="modal-title">다른 랙으로 이동</h3>
+        <button id="closeMoveModal" class="close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">현재 셀 재고를 비우고 선택한 위치로 옮깁니다.</p>
+        <div class="form-group">
+          <label for="moveSheetSelect">구역(시트)</label>
+          <select id="moveSheetSelect" class="form-control"></select>
+        </div>
+        <div class="move-fields-row">
+          <div class="form-group">
+            <label for="moveRow">행</label>
+            <input type="number" id="moveRow" class="form-control" min="1" value="1">
+          </div>
+          <div class="form-group">
+            <label for="moveCol">열</label>
+            <input type="number" id="moveCol" class="form-control" min="1" value="1">
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="cancelMoveBtn" type="button" class="btn-secondary">취소</button>
+        <button id="confirmMoveBtn" type="button" class="btn-primary">이동하기</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+  <!-- Supabase JS 라이브러리 CDN 로드 및 연동 설정 파일 로드 -->
+  <script src="config.js" onerror="void 0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="app.js?v=20260708o" defer></script>
+</body>
+</html>
