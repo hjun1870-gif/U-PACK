@@ -1569,6 +1569,11 @@ function renderGridFooters(leftRacks, rightRacks) {
   gridBoard.appendChild(emptyRight);
 }
 
+function includesProductSearch(productName, query) {
+  if (!query) return false;
+  return String(productName ?? "").trim().toLowerCase().includes(query.trim().toLowerCase());
+}
+
 function matchesProductSearch(productName, query) {
   if (!query) return false;
   return String(productName ?? "").trim().toLowerCase() === query.trim().toLowerCase();
@@ -1587,7 +1592,7 @@ function handleSearch(e) {
     cell.classList.remove("search-highlight");
     if (query !== "") {
       const prodName = cell.dataset.product;
-      if (matchesProductSearch(prodName, query)) {
+      if (includesProductSearch(prodName, query)) {
         cell.classList.add("search-highlight");
       }
     }
@@ -1634,7 +1639,7 @@ function handleSearch(e) {
 
         if (cellObj && cellObj.v !== undefined) {
           const prodNameVal = String(cellObj.v).trim();
-          if (matchesProductSearch(prodNameVal, query)) {
+          if (includesProductSearch(prodNameVal, query)) {
             // 수량 추출 (없거나 형식이 다르면 0으로 방어)
             const pQty = (palletObj && palletObj.v !== undefined) ? (Number(palletObj.v) || 0) : 0;
             const bQty = (boxObj && boxObj.v !== undefined) ? (Number(boxObj.v) || 0) : 0;
@@ -1645,7 +1650,8 @@ function handleSearch(e) {
               row: r,
               col: c,
               pallet: pQty,
-              box: bQty
+              box: bQty,
+              exactMatch: matchesProductSearch(prodNameVal, query),
             });
           }
         }
@@ -1659,10 +1665,11 @@ function handleSearch(e) {
   if (matches.length > 0) {
     searchResultsWrap.style.display = "block"; // 래퍼를 보여준다 = 창고 도면이 자연스럽게 아래로 밀림
 
-    // 4.1. 전체 매칭 항목에 대해 총 파렛트(P), 총 박스(B) 실시간 요약 연산
+    // 4.1. 완전 일치 항목만 요약 카운터(P, B)에 반영
+    const exactMatches = matches.filter((m) => m.exactMatch);
     let grandTotalPallets = 0;
     let grandTotalBoxes = 0;
-    matches.forEach((m) => {
+    exactMatches.forEach((m) => {
       grandTotalPallets += m.pallet;
       grandTotalBoxes += m.box;
     });
@@ -1673,7 +1680,7 @@ function handleSearch(e) {
     summaryHeader.innerHTML = `
       <span class="summary-title">🔍 '${searchInput.value}' 검색 요약</span>
       <div class="summary-values">
-        <span>매칭: <strong>${matches.length}</strong>곳</span>
+        <span>매칭: <strong>${exactMatches.length}</strong>곳</span>
         <span class="summary-val-p">파렛트(P): <strong>${grandTotalPallets}</strong></span>
         <span class="summary-val-b">박스(B): <strong>${grandTotalBoxes}</strong></span>
       </div>
