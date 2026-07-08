@@ -293,6 +293,14 @@ header {
   color: var(--accent-cyan);
 }
 
+.summary-item .value.total-match-ok {
+  color: #10b981;
+}
+
+.summary-item .value.total-match-mismatch {
+  color: #f87171;
+}
+
 /* 동기화 상태 배지 */
 .sync-badge {
   padding: 0.6rem 1rem;

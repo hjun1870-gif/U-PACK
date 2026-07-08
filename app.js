@@ -419,6 +419,9 @@ const LAST_SHEET_KEY = "last_sheet_name";
 /** TOTAL 시트 열 정의 (0-based) */
 const TOTAL_HEADER_ROW = 4;
 const TOTAL_DATA_START_ROW = 5;
+/** 입수량·박스단위 참조 시트 (헤더 2행, 데이터 3행~) */
+const PACK_UNIT_SHEET_HINT = "입수량";
+const PACK_UNIT_BOX_HINT = "박스단위";
 const TOTAL_COL = {
   PRODUCT: 0,
   IPSUR: 1,
@@ -1037,6 +1040,12 @@ function isSummarySheetName(sheetName) {
   return upper === "TOTAL" || sheetName.includes("합계");
 }
 
+/** 입수량·박스단위 참조 시트 여부 */
+function isPackUnitSheetName(sheetName) {
+  const name = String(sheetName);
+  return name.includes(PACK_UNIT_SHEET_HINT) && name.includes(PACK_UNIT_BOX_HINT);
+}
+
 /**
  * 시트에 창고 도면(랙 격자) 구조가 있는지 판별
  */
@@ -1078,6 +1087,7 @@ function getWarehouseSheetNames(workbook) {
   if (!workbook) return [];
   return workbook.SheetNames.filter((name) => {
     if (isSummarySheetName(name)) return false;
+    if (isPackUnitSheetName(name)) return false;
     return hasWarehouseLayout(workbook.Sheets[name]);
   });
 }
@@ -2465,10 +2475,50 @@ function findTotalSheet(workbook) {
   return name ? workbook.Sheets[name] : null;
 }
 
-function findTotalSheetName(workbook) {
-  return workbook.SheetNames.find(
-    (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
-  ) || "TOTAL";
+function findPackUnitSheet(workbook) {
+  if (!workbook) return null;
+  const exact = workbook.SheetNames.find((n) => n === "입수량 박스단위");
+  if (exact) return workbook.Sheets[exact];
+  const name = workbook.SheetNames.find((n) => isPackUnitSheetName(n));
+  return name ? workbook.Sheets[name] : null;
+}
+
+function parseOptionalNumber(val) {
+  if (val === undefined || val === null || String(val).trim() === "") return undefined;
+  const num = Number(val);
+  return Number.isFinite(num) ? num : undefined;
+}
+
+/** 입수량 박스단위 시트 → 제품명별 입수량·박스단위 조회 맵 */
+function readPackUnitLookup(workbook) {
+  const map = new Map();
+  const sheet = findPackUnitSheet(workbook);
+  if (!sheet) return map;
+
+  let dataStartRow = 3;
+  for (let excelRow = 1; excelRow <= 4; excelRow++) {
+    const aCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 })];
+    const bCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 1 })];
+    const aVal = String(aCell?.v ?? "").trim();
+    const bVal = String(bCell?.v ?? "").trim();
+    if (aVal.includes("제품") || bVal.includes("입수")) {
+      dataStartRow = excelRow + 1;
+      break;
+    }
+  }
+
+  for (let excelRow = dataStartRow; excelRow <= 500; excelRow++) {
+    const aCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 })];
+    if (!aCell || aCell.v === undefined || String(aCell.v).trim() === "") break;
+    const prodName = String(aCell.v).trim();
+    const bCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 1 })];
+    const cCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 2 })];
+    map.set(prodName, {
+      ipsuryang: parseOptionalNumber(bCell?.v),
+      box_danyi: parseOptionalNumber(cCell?.v),
+    });
+  }
+  return map;
 }
 
 /** TOTAL 시트가 없으면 헤더 포함 새 시트 생성 */
@@ -2634,8 +2684,6 @@ function readTotalSheetRowMetadata(totalSheet) {
       return cell?.v !== undefined ? cell.v : undefined;
     };
     meta.set(prodName, {
-      ipsuryang: readVal(TOTAL_COL.IPSUR),
-      box_danyi: readVal(TOTAL_COL.BOX_UNIT),
       janryang: readVal(TOTAL_COL.JAN),
       chulgo: readVal(TOTAL_COL.CHULGO),
       panmae_ilbo: readVal(TOTAL_COL.PANMAE),
@@ -2680,6 +2728,7 @@ function aggregateTotalSheet(workbook) {
   ensureTotalLocationHeader(totalSheet);
 
   const warehouseProducts = collectWarehouseProductData(workbook);
+  const packUnitLookup = readPackUnitLookup(workbook);
   const preservedMeta = readTotalSheetRowMetadata(totalSheet);
   const oldLastRow = getTotalSheetLastDataRow(totalSheet);
 
@@ -2705,6 +2754,7 @@ function aggregateTotalSheet(workbook) {
     const excelRow = TOTAL_DATA_START_ROW + idx;
     const totals = warehouseProducts.get(prodName) || { pallet: 0, box: 0, locations: new Set() };
     const meta = preservedMeta.get(prodName) || {};
+    const packInfo = packUnitLookup.get(prodName);
     const locationText = [...totals.locations]
       .sort((a, b) => a.localeCompare(b, "ko"))
       .join(", ");
@@ -2712,8 +2762,8 @@ function aggregateTotalSheet(workbook) {
     const checkLabel = resolveTotalCheckLabel(originalQty, totals, hadTotalSheet);
 
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.PRODUCT, prodName, "s");
-    writeTotalCell(totalSheet, excelRow, TOTAL_COL.IPSUR, meta.ipsuryang);
-    writeTotalCell(totalSheet, excelRow, TOTAL_COL.BOX_UNIT, meta.box_danyi);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.IPSUR, packInfo?.ipsuryang);
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.BOX_UNIT, packInfo?.box_danyi);
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.PALLET, totals.pallet);
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.BOX, totals.box);
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.JAN, meta.janryang);
