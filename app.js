@@ -2902,8 +2902,11 @@ function computeWarehousePrintColumnWidths(sheet, colMapping, maxCols, maxRows, 
       }
     }
 
-    widths[pCol] = { wch: Math.min(16, Math.max(5, maxProductLen)) };
-    widths[bCol] = { wch: Math.max(3.5, maxQtyLen + 0.5) };
+    // P/B 열 동일 너비 — 제품명은 P+B 병합 셀 기준으로 쌍 너비 계산
+    const pairTotalNeed = Math.max(maxProductLen, maxQtyLen + 1);
+    const pairColWch = Math.min(12, Math.max(4.5, Math.ceil(pairTotalNeed / 2) + 0.5));
+    widths[pCol] = { wch: pairColWch };
+    widths[bCol] = { wch: pairColWch };
   }
 
   widths[rightLabelCol] = { wch: 3.5 };
@@ -3057,6 +3060,13 @@ function applyWarehouseMerges(sheet, { maxCols, maxRows, colMapping, aisleCols, 
   for (let r = 1; r <= maxRows; r++) {
     const prodRowIdx = getWarehouseProdRowIdx(r);
     const qtyRowIdx = getWarehouseQtyRowIdx(r);
+
+    // 제품명 행: P+B 가로 병합 (참고 이미지와 동일)
+    for (let c = 1; c <= maxCols; c++) {
+      const pCol = colMapping[c];
+      if (pCol === undefined) continue;
+      merges.push({ s: { r: prodRowIdx, c: pCol }, e: { r: prodRowIdx, c: pCol + 1 } });
+    }
 
     const leftLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
     if (sheet[leftLabelAddr]?.v !== undefined) {
