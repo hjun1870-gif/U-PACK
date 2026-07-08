@@ -1569,6 +1569,11 @@ function renderGridFooters(leftRacks, rightRacks) {
   gridBoard.appendChild(emptyRight);
 }
 
+function matchesProductSearch(productName, query) {
+  if (!query) return false;
+  return String(productName ?? "").trim().toLowerCase() === query.trim().toLowerCase();
+}
+
 /**
  * 4. 재고 검색 및 위치 네비게이션 기능 (전 구역 통합 검색 지원)
  */
@@ -1582,7 +1587,7 @@ function handleSearch(e) {
     cell.classList.remove("search-highlight");
     if (query !== "") {
       const prodName = cell.dataset.product;
-      if (prodName && prodName.includes(query)) {
+      if (matchesProductSearch(prodName, query)) {
         cell.classList.add("search-highlight");
       }
     }
@@ -1629,7 +1634,7 @@ function handleSearch(e) {
 
         if (cellObj && cellObj.v !== undefined) {
           const prodNameVal = String(cellObj.v).trim();
-          if (prodNameVal.toLowerCase().includes(query)) {
+          if (matchesProductSearch(prodNameVal, query)) {
             // 수량 추출 (없거나 형식이 다르면 0으로 방어)
             const pQty = (palletObj && palletObj.v !== undefined) ? (Number(palletObj.v) || 0) : 0;
             const bQty = (boxObj && boxObj.v !== undefined) ? (Number(boxObj.v) || 0) : 0;
