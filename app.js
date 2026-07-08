@@ -3323,7 +3323,8 @@ function applyExcelStyles(workbook) {
     const aisleCols = getAisleColumnSet(sheet);
 
     const lastColIdx = colMapping[maxCols] || (2 * maxCols + 1);
-    const rightLabelCol = lastColIdx + 1;
+    // lastColIdx = 마지막 랙 P열, +1 = B열 → 우측 행번호는 B열 다음(+2)이어야 병합 충돌 없음
+    const rightLabelCol = lastColIdx + 2;
 
     const colWidthMap = computeWarehousePrintColumnWidths(
       sheet, colMapping, maxCols, maxRows, aisleCols, rightLabelCol
