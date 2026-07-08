@@ -11,7 +11,7 @@
   <meta name="description" content="엑셀 기반의 창고 재고 데이터를 시각적인 랙(Rack) 레이아웃으로 변환하고 직관적으로 수정을 돕는 웹 애플리케이션입니다.">
   
   <!-- 디자인 스타일시트 연결 -->
-  <link rel="stylesheet" href="styles.css?v=20260708p">
+  <link rel="stylesheet" href="styles.css?v=20260708q">
   
   <!-- 외부 엑셀 파싱 및 스타일 라이브러리 (xlsx-js-style) CDN 로드 -->
   <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
@@ -73,8 +73,9 @@
           <ul id="searchAutocomplete" class="search-autocomplete" role="listbox" style="display: none;"></ul>
         </div>
 
-        <!-- 수정본 엑셀 내보내기 버튼 (기본은 비활성화 상태) -->
+        <!-- 수정본 엑셀 / HTML 보고서 내보내기 -->
         <button id="exportBtn" class="export-btn" style="display: none;">수정된 엑셀 다운로드</button>
+        <button id="exportHtmlBtn" class="export-html-btn" style="display: none;" title="창고별 재고 현황을 사장님 보고용 HTML로 저장">HTML 보고서</button>
       </div>
     </header>
 
@@ -296,6 +297,6 @@
   <!-- Supabase JS 라이브러리 CDN 로드 및 연동 설정 파일 로드 -->
   <script src="config.js" onerror="void 0"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="app.js?v=20260708p" defer></script>
+  <script src="app.js?v=20260708q" defer></script>
 </body>
 </html>

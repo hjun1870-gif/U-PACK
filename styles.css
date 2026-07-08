@@ -266,6 +266,31 @@ header {
   box-shadow: 0 6px 16px rgba(16, 185, 129, 0.5);
 }
 
+.export-html-btn {
+  background: linear-gradient(135deg, #6366f1, #4f46e5);
+  color: #fff;
+  border: none;
+  padding: 0.6rem 1.2rem;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+}
+
+.export-html-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(99, 102, 241, 0.5);
+}
+
+.export-html-btn:disabled,
+.export-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
 /* 통계 및 요약 정보판 */
 .summary-bar {
   background: rgba(30, 41, 59, 0.55);
@@ -960,6 +985,7 @@ header {
   .sheet-select, 
   .search-input, 
   .export-btn, 
+  .export-html-btn,
   #demoBtn,
   #cloudSyncBtn,
   #dbConfigBtn,
@@ -978,6 +1004,7 @@ header {
   .sheet-select, 
   .search-input, 
   .export-btn, 
+  .export-html-btn,
   #demoBtn,
   #cloudSyncBtn,
   #dbConfigBtn {

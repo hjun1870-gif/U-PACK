@@ -99,6 +99,7 @@ const searchAutocomplete = document.getElementById("searchAutocomplete");
 const searchResults = document.getElementById("searchResults");     // 결과 목록 패널
 const searchResultsWrap = document.getElementById("searchResultsWrap"); // 래퍼: 이것을 show/hide하여 창고 도면을 밀어냄
 const exportBtn = document.getElementById("exportBtn");
+const exportHtmlBtn = document.getElementById("exportHtmlBtn");
 const gridBoard = document.getElementById("gridBoard");
 const emptyGuide = document.getElementById("emptyGuide");
 
@@ -177,7 +178,7 @@ function setGlobalLoading(loading, statusText) {
   }
   const busy = globalLoadingCount > 0;
   document.body.classList.toggle("is-loading", busy);
-  [exportBtn, cloudSyncBtn, demoBtn].forEach((btn) => {
+  [exportBtn, exportHtmlBtn, cloudSyncBtn, demoBtn].forEach((btn) => {
     if (btn) btn.disabled = busy;
   });
   const uploadBtn = document.querySelector(".file-upload-btn");
@@ -929,6 +930,7 @@ searchInput.addEventListener("input", handleSearchInput);
 searchInput.addEventListener("focus", handleSearchInput);
 searchInput.addEventListener("keydown", handleSearchKeydown);
 exportBtn.addEventListener("click", exportUpdatedExcel);
+exportHtmlBtn.addEventListener("click", exportWarehouseHtmlReport);
 
 // 모달 닫기 이벤트들
 closeModal.addEventListener("click", hideModal);
@@ -1245,6 +1247,7 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   emptyGuide.style.display = "none";
   gridBoard.style.display = "grid";
   exportBtn.style.display = "inline-block";
+  if (exportHtmlBtn) exportHtmlBtn.style.display = "inline-block";
   showWorkbookControls();
 
   const defaultSheet = resolveDefaultSheetName(
@@ -2465,6 +2468,512 @@ function exportUpdatedExcel() {
     showToast(`다운로드: ${filename}`, "success", 4000);
   } catch (err) {
     alert("엑셀 파일을 생성하고 다운로드하는 도중 오류가 발생했습니다.");
+    console.error(err);
+  } finally {
+    setGlobalLoading(false);
+  }
+}
+
+function escapeHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formatReportNumber(value) {
+  const num = Number(value) || 0;
+  return num.toLocaleString("ko-KR");
+}
+
+/**
+ * 단일 창고 시트의 사장님 보고용 데이터 수집
+ */
+function collectWarehouseReportData(workbook, sheetName) {
+  const sheet = workbook.Sheets[sheetName];
+  if (!sheet) return null;
+
+  const { leftRacks, rightRacks } = detectRacks(sheet);
+  const leftCols = leftRacks.length;
+  const rightCols = rightRacks.length;
+  const maxRows = detectMaxRows(sheet);
+  const colMapping = detectColumnMapping(sheet);
+  const maxCols = leftCols + rightCols;
+  const totalRacks = maxCols * maxRows;
+
+  let totalProducts = 0;
+  let totalPallets = 0;
+  let totalBoxes = 0;
+  let stockedRacks = 0;
+  const entries = [];
+
+  for (let r = 1; r <= maxRows; r++) {
+    const prodRowIdx = 7 + 2 * (r - 1);
+    const qtyRowIdx = 8 + 2 * (r - 1);
+
+    leftRacks.forEach((rackInfo, idx) => {
+      const colSeq = idx + 1;
+      const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+      if (!cellData.product && cellData.pallet <= 0 && cellData.box <= 0) return;
+      if (cellData.product) {
+        totalProducts++;
+        totalPallets += cellData.pallet;
+        totalBoxes += cellData.box;
+      }
+      stockedRacks++;
+      entries.push({
+        row: r,
+        colSeq,
+        rackNo: rackInfo.rackNo,
+        side: "좌",
+        product: cellData.product || "(미입력)",
+        pallet: cellData.pallet,
+        box: cellData.box,
+      });
+    });
+
+    rightRacks.forEach((rackInfo, idx) => {
+      const colSeq = leftCols + idx + 1;
+      const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+      if (!cellData.product && cellData.pallet <= 0 && cellData.box <= 0) return;
+      if (cellData.product) {
+        totalProducts++;
+        totalPallets += cellData.pallet;
+        totalBoxes += cellData.box;
+      }
+      stockedRacks++;
+      entries.push({
+        row: r,
+        colSeq,
+        rackNo: rackInfo.rackNo,
+        side: "우",
+        product: cellData.product || "(미입력)",
+        pallet: cellData.pallet,
+        box: cellData.box,
+      });
+    });
+  }
+
+  entries.sort((a, b) => a.row - b.row || a.colSeq - b.colSeq);
+
+  const occupancyPct = totalRacks > 0 ? Math.round((stockedRacks / totalRacks) * 100) : 0;
+
+  return {
+    sheetName,
+    displayTitle: parseSheetDisplayTitle(sheet, sheetName),
+    headerLabel: parseSheetHeaderLabel(sheet, sheetName),
+    leftCols,
+    rightCols,
+    maxRows,
+    maxCols,
+    leftRacks,
+    rightRacks,
+    colMapping,
+    totalProducts,
+    totalPallets,
+    totalBoxes,
+    stockedRacks,
+    totalRacks,
+    occupancyPct,
+    entries,
+  };
+}
+
+function buildWarehouseReportGridHtml(data) {
+  const { sheet, leftRacks, rightRacks, leftCols, maxRows, colMapping } = data;
+  const rackHeader = (racks) =>
+    racks
+      .map((rack) => `<th colspan="2">${escapeHtml(rack.rackNo)}</th>`)
+      .join("");
+
+  let html = `<table class="rack-grid"><thead><tr>`;
+  html += `<th class="corner"></th>${rackHeader(leftRacks)}`;
+  html += `<th class="aisle-head" rowspan="3">통<br>로</th>${rackHeader(rightRacks)}`;
+  html += `<th class="corner"></th></tr><tr>`;
+  html += `<th class="corner"></th>`;
+  leftRacks.forEach(() => {
+    html += `<th>P</th><th>B</th>`;
+  });
+  rightRacks.forEach(() => {
+    html += `<th>P</th><th>B</th>`;
+  });
+  html += `<th class="corner"></th></tr><tr>`;
+  html += `<th class="corner"></th>`;
+  leftRacks.forEach(() => {
+    html += `<th class="subhead">제품</th><th class="subhead"></th>`;
+  });
+  rightRacks.forEach(() => {
+    html += `<th class="subhead">제품</th><th class="subhead"></th>`;
+  });
+  html += `<th class="corner"></th></tr></thead><tbody>`;
+
+  for (let r = 1; r <= maxRows; r++) {
+    const prodRowIdx = 7 + 2 * (r - 1);
+    const qtyRowIdx = 8 + 2 * (r - 1);
+
+    html += `<tr><td class="row-label">${r}</td>`;
+
+    leftRacks.forEach((rackInfo, idx) => {
+      const colSeq = idx + 1;
+      const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+      const stocked = cell.product || cell.pallet > 0 || cell.box > 0;
+      html += `<td class="prod ${stocked ? "stocked" : ""}" colspan="2">${escapeHtml(cell.product)}</td>`;
+    });
+
+    html += `<td class="aisle"></td>`;
+
+    rightRacks.forEach((rackInfo, idx) => {
+      const colSeq = leftCols + idx + 1;
+      const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+      const stocked = cell.product || cell.pallet > 0 || cell.box > 0;
+      html += `<td class="prod ${stocked ? "stocked" : ""}" colspan="2">${escapeHtml(cell.product)}</td>`;
+    });
+
+    html += `<td class="row-label">${r}</td></tr>`;
+
+    html += `<tr><td class="row-label pb-label">P/B</td>`;
+    leftRacks.forEach((_, idx) => {
+      const colSeq = idx + 1;
+      const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+      html += `<td class="qty">${cell.pallet || ""}</td><td class="qty">${cell.box || ""}</td>`;
+    });
+    html += `<td class="aisle"></td>`;
+    rightRacks.forEach((_, idx) => {
+      const colSeq = leftCols + idx + 1;
+      const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+      html += `<td class="qty">${cell.pallet || ""}</td><td class="qty">${cell.box || ""}</td>`;
+    });
+    html += `<td class="row-label pb-label">P/B</td></tr>`;
+  }
+
+  html += `</tbody></table>`;
+  return html;
+}
+
+function buildWarehouseReportSectionHtml(reportData, workbook) {
+  const sheet = workbook.Sheets[reportData.sheetName];
+  const gridHtml = buildWarehouseReportGridHtml({ ...reportData, sheet });
+
+  const rowsHtml = reportData.entries
+    .map(
+      (entry, idx) => `
+      <tr>
+        <td class="num">${idx + 1}</td>
+        <td>${entry.row}행 · ${entry.side}${entry.colSeq}열</td>
+        <td>${escapeHtml(entry.rackNo)}</td>
+        <td class="product">${escapeHtml(entry.product)}</td>
+        <td class="num">${formatReportNumber(entry.pallet)}</td>
+        <td class="num">${formatReportNumber(entry.box)}</td>
+      </tr>`
+    )
+    .join("");
+
+  const emptyRow =
+    reportData.entries.length === 0
+      ? `<tr><td colspan="6" class="empty">적재된 재고가 없습니다.</td></tr>`
+      : rowsHtml;
+
+  return `
+    <section class="warehouse-section">
+      <header class="section-head">
+        <div>
+          <p class="section-eyebrow">창고 구역</p>
+          <h2>${escapeHtml(reportData.displayTitle)}</h2>
+          <p class="section-sub">${escapeHtml(reportData.headerLabel)} · 좌${reportData.leftCols} / 우${reportData.rightCols}열 × ${reportData.maxRows}행</p>
+        </div>
+        <div class="kpi-row">
+          <div class="kpi"><span>적재 품목</span><strong>${formatReportNumber(reportData.totalProducts)}</strong></div>
+          <div class="kpi"><span>파렛트(P)</span><strong>${formatReportNumber(reportData.totalPallets)}</strong></div>
+          <div class="kpi"><span>박스(B)</span><strong>${formatReportNumber(reportData.totalBoxes)}</strong></div>
+          <div class="kpi"><span>점유율</span><strong>${reportData.stockedRacks}/${reportData.totalRacks} (${reportData.occupancyPct}%)</strong></div>
+        </div>
+      </header>
+
+      <h3 class="block-title">재고 상세 목록</h3>
+      <table class="detail-table">
+        <thead>
+          <tr>
+            <th>No</th>
+            <th>위치</th>
+            <th>랙번호</th>
+            <th>제품명</th>
+            <th>P</th>
+            <th>B</th>
+          </tr>
+        </thead>
+        <tbody>${emptyRow}</tbody>
+      </table>
+
+      <h3 class="block-title">도면 배치도</h3>
+      <div class="grid-wrap">${gridHtml}</div>
+    </section>`;
+}
+
+function buildBossReportHtmlDocument(workbook) {
+  const printDate = new Date().toLocaleString("ko-KR", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const sheetNames = getWarehouseSheetNames(workbook);
+  const reports = sheetNames
+    .map((name) => collectWarehouseReportData(workbook, name))
+    .filter(Boolean);
+
+  const grand = reports.reduce(
+    (acc, r) => {
+      acc.products += r.totalProducts;
+      acc.pallets += r.totalPallets;
+      acc.boxes += r.totalBoxes;
+      acc.stocked += r.stockedRacks;
+      acc.total += r.totalRacks;
+      return acc;
+    },
+    { products: 0, pallets: 0, boxes: 0, stocked: 0, total: 0 }
+  );
+  const grandPct = grand.total > 0 ? Math.round((grand.stocked / grand.total) * 100) : 0;
+
+  const overviewRows = reports
+    .map(
+      (r) => `
+      <tr>
+        <td>${escapeHtml(r.displayTitle)}</td>
+        <td class="num">${formatReportNumber(r.totalProducts)}</td>
+        <td class="num">${formatReportNumber(r.totalPallets)}</td>
+        <td class="num">${formatReportNumber(r.totalBoxes)}</td>
+        <td class="num">${r.stockedRacks}/${r.totalRacks} (${r.occupancyPct}%)</td>
+      </tr>`
+    )
+    .join("");
+
+  const sectionsHtml = reports
+    .map((data) => buildWarehouseReportSectionHtml(data, workbook))
+    .join("");
+
+  return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>재고조사 보고서 ${new Date().toISOString().slice(0, 10)}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+      color: #1e293b;
+      background: #f1f5f9;
+      line-height: 1.5;
+    }
+    .report-page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 20px 48px;
+    }
+    .report-cover {
+      background: linear-gradient(135deg, #1e3a5f, #2563eb);
+      color: #fff;
+      border-radius: 12px;
+      padding: 28px 32px;
+      margin-bottom: 24px;
+      box-shadow: 0 8px 24px rgba(30, 58, 95, 0.25);
+    }
+    .report-cover h1 { font-size: 1.75rem; margin-bottom: 6px; }
+    .report-cover .meta { opacity: 0.9; font-size: 0.95rem; }
+    .report-cover .grand-kpi {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .report-cover .grand-kpi div {
+      background: rgba(255,255,255,0.12);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .report-cover .grand-kpi span { display: block; font-size: 0.78rem; opacity: 0.85; }
+    .report-cover .grand-kpi strong { font-size: 1.35rem; }
+    .overview-table, .detail-table, .rack-grid {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+    }
+    .overview-wrap {
+      background: #fff;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 28px;
+      border: 1px solid #e2e8f0;
+    }
+    .overview-wrap h2 { font-size: 1.05rem; margin-bottom: 12px; color: #1e3a5f; }
+    .overview-table th, .overview-table td,
+    .detail-table th, .detail-table td {
+      border: 1px solid #cbd5e1;
+      padding: 8px 10px;
+      font-size: 0.88rem;
+    }
+    .overview-table th, .detail-table th {
+      background: #1e3a5f;
+      color: #fff;
+      font-weight: 600;
+    }
+    .overview-table tbody tr:nth-child(even) { background: #f8fafc; }
+    .warehouse-section {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 22px 20px 28px;
+      margin-bottom: 28px;
+      page-break-inside: avoid;
+    }
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+      padding-bottom: 14px;
+      border-bottom: 2px solid #1e3a5f;
+    }
+    .section-eyebrow { font-size: 0.75rem; color: #64748b; letter-spacing: 0.04em; }
+    .section-head h2 { font-size: 1.45rem; color: #1e3a5f; margin: 2px 0; }
+    .section-sub { font-size: 0.88rem; color: #64748b; }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(110px, 1fr));
+      gap: 10px;
+    }
+    .kpi {
+      background: #ddebf7;
+      border-radius: 8px;
+      padding: 10px 12px;
+      text-align: center;
+    }
+    .kpi span { display: block; font-size: 0.72rem; color: #475569; }
+    .kpi strong { font-size: 1.05rem; color: #1e3a5f; }
+    .block-title {
+      font-size: 0.95rem;
+      color: #1e3a5f;
+      margin: 18px 0 10px;
+    }
+    .detail-table td.product { font-weight: 600; text-align: left; }
+    .detail-table td.num, .overview-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .detail-table td.empty { text-align: center; color: #94a3b8; padding: 20px; }
+    .grid-wrap { overflow-x: auto; border: 1px solid #cbd5e1; border-radius: 8px; }
+    .rack-grid { font-size: 0.72rem; min-width: 720px; }
+    .rack-grid th, .rack-grid td {
+      border: 1px solid #000;
+      padding: 4px 3px;
+      text-align: center;
+      vertical-align: middle;
+    }
+    .rack-grid thead th {
+      background: #1e3a5f;
+      color: #fff;
+      font-weight: 700;
+    }
+    .rack-grid .subhead { background: #1e3a5f; font-size: 0.68rem; }
+    .rack-grid .row-label, .rack-grid .pb-label {
+      background: #ddebf7;
+      font-weight: 700;
+      width: 28px;
+    }
+    .rack-grid .aisle-head, .rack-grid .aisle {
+      background: #f1f5f9;
+      color: #64748b;
+      font-weight: 600;
+      width: 22px;
+    }
+    .rack-grid .prod { background: #fff; min-width: 52px; height: 28px; }
+    .rack-grid .prod.stocked { font-weight: 700; }
+    .rack-grid .qty { background: #fff; font-variant-numeric: tabular-nums; }
+    .report-footer {
+      text-align: center;
+      color: #64748b;
+      font-size: 0.8rem;
+      margin-top: 12px;
+    }
+    @media print {
+      body { background: #fff; }
+      .report-page { padding: 0; max-width: none; }
+      .warehouse-section { page-break-before: always; box-shadow: none; }
+      .warehouse-section:first-of-type { page-break-before: auto; }
+    }
+    @media (max-width: 768px) {
+      .report-cover .grand-kpi, .kpi-row { grid-template-columns: repeat(2, 1fr); }
+      .section-head { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="report-page">
+    <header class="report-cover">
+      <h1>창고 재고조사 보고서</h1>
+      <p class="meta">출력일시: ${escapeHtml(printDate)} · 구역 ${reports.length}개</p>
+      <div class="grand-kpi">
+        <div><span>전체 적재 품목</span><strong>${formatReportNumber(grand.products)}</strong></div>
+        <div><span>전체 파렛트(P)</span><strong>${formatReportNumber(grand.pallets)}</strong></div>
+        <div><span>전체 박스(B)</span><strong>${formatReportNumber(grand.boxes)}</strong></div>
+        <div><span>전체 점유율</span><strong>${grand.stocked}/${grand.total} (${grandPct}%)</strong></div>
+      </div>
+    </header>
+
+    <div class="overview-wrap">
+      <h2>구역별 요약</h2>
+      <table class="overview-table">
+        <thead>
+          <tr>
+            <th>구역</th>
+            <th>적재 품목</th>
+            <th>파렛트(P)</th>
+            <th>박스(B)</th>
+            <th>점유율</th>
+          </tr>
+        </thead>
+        <tbody>${overviewRows}</tbody>
+      </table>
+    </div>
+
+    ${sectionsHtml}
+
+    <p class="report-footer">U-PACK 창고 재고조사표 시각화 시스템 · 사장님 보고용</p>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * 창고별 재고 현황을 사장님 보고용 HTML 파일로 내보내기
+ */
+function exportWarehouseHtmlReport() {
+  if (!currentWorkbook) return;
+
+  const sheetNames = getWarehouseSheetNames(currentWorkbook);
+  if (sheetNames.length === 0) {
+    alert("내보낼 창고 도면 시트가 없습니다.");
+    return;
+  }
+
+  setGlobalLoading(true, "HTML 보고서 생성 중...");
+  try {
+    const html = buildBossReportHtmlDocument(currentWorkbook);
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const filename = `재고조사_사장님보고_${new Date().toISOString().slice(0, 10)}.html`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    }, 0);
+    showToast(`다운로드: ${filename}`, "success", 4000);
+  } catch (err) {
+    alert("HTML 보고서를 생성하는 도중 오류가 발생했습니다.");
     console.error(err);
   } finally {
     setGlobalLoading(false);
@@ -3805,6 +4314,7 @@ async function loadDataFromSupabase() {
     emptyGuide.style.display = "none";
     gridBoard.style.display = "grid";
     exportBtn.style.display = "inline-block";
+  if (exportHtmlBtn) exportHtmlBtn.style.display = "inline-block";
     showWorkbookControls();
 
     const defaultSheet = resolveDefaultSheetName(
