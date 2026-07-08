@@ -2496,16 +2496,8 @@ function readPackUnitLookup(workbook) {
   if (!sheet) return map;
 
   let dataStartRow = 3;
-  for (let excelRow = 1; excelRow <= 4; excelRow++) {
-    const aCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 })];
-    const bCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 1 })];
-    const aVal = String(aCell?.v ?? "").trim();
-    const bVal = String(bCell?.v ?? "").trim();
-    if (aVal.includes("제품") || bVal.includes("입수")) {
-      dataStartRow = excelRow + 1;
-      break;
-    }
-  }
+  const headerRowIdx = detectPackUnitHeaderRow(sheet);
+  dataStartRow = headerRowIdx + 2;
 
   for (let excelRow = dataStartRow; excelRow <= 500; excelRow++) {
     const aCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 })];
@@ -2823,30 +2815,137 @@ function getAisleColumnSet(sheet) {
 }
 
 /**
- * 제품명 길이에 맞춰 랙(P) 열 너비 계산
+ * 한글·영문 혼합 텍스트의 Excel 열 너비(wch) 추정
  */
-function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
+function measureDisplayWidth(text, fontSize = 8) {
+  const str = String(text ?? "").trim();
+  if (!str) return 0;
+  let units = 0;
+  for (const ch of str) {
+    units += ch.charCodeAt(0) > 127 ? 2 : 1;
+  }
+  const sizeFactor = fontSize / 8;
+  return Math.ceil(units * sizeFactor) + 1;
+}
+
+/** 랙 열에 재고가 하나라도 있는지 */
+function rackColumnHasStock(sheet, colMapping, rackCol, maxRows) {
+  const pCol = colMapping[rackCol];
+  if (pCol === undefined) return false;
+  const bCol = pCol + 1;
+
+  for (let r = 1; r <= maxRows; r++) {
+    const prodRowIdx = getWarehouseProdRowIdx(r);
+    const qtyRowIdx = getWarehouseQtyRowIdx(r);
+    const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pCol });
+    const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pCol });
+    const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: bCol });
+
+    const product = String(sheet[prodAddr]?.v ?? "").trim();
+    const pallet = Number(sheet[palletAddr]?.v) || 0;
+    const box = Number(sheet[boxAddr]?.v) || 0;
+    if (product || pallet > 0 || box > 0) return true;
+  }
+  return false;
+}
+
+/** 재고가 있는 마지막 랙 번호 (없으면 1) */
+function getLastStockRackIndex(sheet, colMapping, maxCols, maxRows) {
+  let last = 0;
+  for (let c = 1; c <= maxCols; c++) {
+    if (rackColumnHasStock(sheet, colMapping, c, maxRows)) last = c;
+  }
+  return Math.max(last, 1);
+}
+
+/**
+ * A4 가로 1장 인쇄용 열 너비 — 콘텐츠 길이 기반 자동 조절 + 빈 랙 축소
+ */
+function computeWarehousePrintColumnWidths(sheet, colMapping, maxCols, maxRows, aisleCols, rightLabelCol) {
   const widths = [];
-  widths[0] = { wch: 4 };
+  const lastStockRack = getLastStockRackIndex(sheet, colMapping, maxCols, maxRows);
+  widths[0] = { wch: 3.5 };
 
   for (let c = 1; c <= maxCols; c++) {
     const pCol = colMapping[c];
     if (pCol === undefined) continue;
+    const bCol = pCol + 1;
+    const hasStock = rackColumnHasStock(sheet, colMapping, c, maxRows);
+    const isTrailingEmpty = c > lastStockRack && !hasStock;
 
-    let maxLen = 6;
+    if (isTrailingEmpty) {
+      widths[pCol] = { wch: 2.2, hidden: true };
+      widths[bCol] = { wch: 2, hidden: true };
+      continue;
+    }
+
+    let maxProductLen = 4;
+    let maxQtyLen = 2;
     for (let r = 1; r <= maxRows; r++) {
-      const prodRowIdx = 7 + 2 * (r - 1);
+      const prodRowIdx = getWarehouseProdRowIdx(r);
+      const qtyRowIdx = getWarehouseQtyRowIdx(r);
       const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pCol });
-      const cell = sheet[prodAddr];
-      if (cell?.v !== undefined) {
-        maxLen = Math.max(maxLen, String(cell.v).trim().length);
+      const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pCol });
+      const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: bCol });
+
+      const product = sheet[prodAddr]?.v;
+      if (product !== undefined) {
+        maxProductLen = Math.max(maxProductLen, measureDisplayWidth(product, 8));
+      }
+      const pallet = sheet[palletAddr]?.v;
+      const box = sheet[boxAddr]?.v;
+      if (pallet !== undefined && pallet !== "") {
+        maxQtyLen = Math.max(maxQtyLen, measureDisplayWidth(pallet, 8));
+      }
+      if (box !== undefined && box !== "") {
+        maxQtyLen = Math.max(maxQtyLen, measureDisplayWidth(box, 8));
       }
     }
 
+    widths[pCol] = { wch: Math.min(16, Math.max(5, maxProductLen)) };
+    widths[bCol] = { wch: Math.max(3.5, maxQtyLen + 0.5) };
+  }
+
+  widths[rightLabelCol] = { wch: 3.5 };
+
+  for (const colIdx of aisleCols) {
+    widths[colIdx] = { wch: 1.8 };
+  }
+
+  // A4 가로 인쇄 가능 폭(wch)에 맞게 비율 축소
+  const A4_LANDSCAPE_WCH_BUDGET = 105;
+  let totalWch = 0;
+  for (let i = 0; i <= rightLabelCol; i++) {
+    if (widths[i] && !widths[i].hidden) totalWch += widths[i].wch || 0;
+  }
+  if (totalWch > A4_LANDSCAPE_WCH_BUDGET) {
+    const scale = A4_LANDSCAPE_WCH_BUDGET / totalWch;
+    for (let i = 0; i <= rightLabelCol; i++) {
+      if (widths[i] && !widths[i].hidden) {
+        widths[i] = { ...widths[i], wch: Math.max(1.8, Math.round(widths[i].wch * scale * 10) / 10) };
+      }
+    }
+  }
+
+  return widths;
+}
+
+/** @deprecated computeWarehousePrintColumnWidths 사용 */
+function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
+  const widths = [];
+  widths[0] = { wch: 4 };
+  for (let c = 1; c <= maxCols; c++) {
+    const pCol = colMapping[c];
+    if (pCol === undefined) continue;
+    let maxLen = 6;
+    for (let r = 1; r <= maxRows; r++) {
+      const prodAddr = XLSX.utils.encode_cell({ r: getWarehouseProdRowIdx(r), c: pCol });
+      const cell = sheet[prodAddr];
+      if (cell?.v !== undefined) maxLen = Math.max(maxLen, String(cell.v).trim().length);
+    }
     widths[pCol] = { wch: Math.min(24, Math.max(12, maxLen + 2)) };
     widths[pCol + 1] = { wch: 7 };
   }
-
   return widths;
 }
 
@@ -2882,7 +2981,11 @@ function reconcileSheetRange(sheet) {
 function buildDenseColumnWidths(widthMap, lastColIdx, aisleCols) {
   const cols = [];
   for (let i = 0; i <= lastColIdx; i++) {
-    cols[i] = widthMap[i] || (aisleCols.has(i) ? { wch: 3 } : { wch: 4 });
+    if (widthMap[i]) {
+      cols[i] = { ...widthMap[i] };
+    } else {
+      cols[i] = aisleCols.has(i) ? { wch: 1.8 } : { wch: 3 };
+    }
   }
   return cols;
 }
@@ -2895,12 +2998,25 @@ function ensureStyledCell(sheet, addr, fallback = { t: "s", v: "" }) {
 }
 
 const WAREHOUSE_LAYOUT = {
-  LEGEND_ROW: 2,
+  SUBTITLE_ROW: 2,
   TITLE_ROW: 3,
   COL_NUM_ROW: 4,
   PRODUCT_LABEL_ROW: 5,
   PB_HEADER_ROW: 6,
   DATA_START_ROW: 7,
+};
+
+const WAREHOUSE_PRINT = {
+  FONT: "맑은 고딕",
+  FONT_TITLE: 11,
+  FONT_HEADER: 8,
+  FONT_DATA: 8,
+  FONT_PRODUCT: 8,
+  ROW_SUBTITLE: 14,
+  ROW_TITLE: 20,
+  ROW_HEADER: 13,
+  ROW_PRODUCT: 15,
+  ROW_QTY: 13,
 };
 
 function getWarehouseProdRowIdx(logicalRow) {
@@ -2960,18 +3076,206 @@ function applyWarehouseMerges(sheet, { maxCols, maxRows, colMapping, aisleCols, 
   }
 
   const legendEndCol = Math.min(rightLabelCol, 12);
-  merges.push({
-    s: { r: WAREHOUSE_LAYOUT.LEGEND_ROW, c: 2 },
-    e: { r: WAREHOUSE_LAYOUT.LEGEND_ROW, c: legendEndCol },
-  });
+  merges.push(
+    { s: { r: WAREHOUSE_LAYOUT.SUBTITLE_ROW, c: 0 }, e: { r: WAREHOUSE_LAYOUT.SUBTITLE_ROW, c: legendEndCol } },
+    { s: { r: WAREHOUSE_LAYOUT.TITLE_ROW, c: 0 }, e: { r: WAREHOUSE_LAYOUT.TITLE_ROW, c: legendEndCol } }
+  );
 
   sheet["!merges"] = merges;
 }
 
-function applyWarehouseLegend(sheet, sLegend) {
-  const addr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.LEGEND_ROW, c: 2 });
-  sheet[addr] = { t: "s", v: "P = 파렛트  |  B = 박스  |  ■ = 재고 있음" };
-  sheet[addr].s = sLegend;
+function applyWarehouseTitleBlock(sheet, sheetName, styles) {
+  const titleAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.TITLE_ROW, c: 0 });
+  const existingTitle = sheet["C4"]?.v || sheet[titleAddr]?.v;
+  const titleText = existingTitle
+    ? String(existingTitle).trim()
+    : `<재고조사표 - ${sheetName}>`;
+  const printDate = new Date().toISOString().slice(0, 10);
+
+  sheet[titleAddr] = { t: "s", v: titleText };
+  sheet[titleAddr].s = styles.sTitle;
+
+  const subAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.SUBTITLE_ROW, c: 0 });
+  sheet[subAddr] = { t: "s", v: `P = 파렛트(파란)   B = 박스(빨강)   ■ = 재고 있음   │   출력일: ${printDate}` };
+  sheet[subAddr].s = styles.sSubtitle;
+}
+
+/**
+ * A4 가로 1장 인쇄 설정
+ */
+function applyWarehousePrintSetup(sheet, rightLabelCol, lastDataRow) {
+  sheet["!margins"] = {
+    left: 0.2,
+    right: 0.2,
+    top: 0.3,
+    bottom: 0.3,
+    header: 0.15,
+    footer: 0.15,
+  };
+  sheet["!pageSetup"] = {
+    paperSize: 9,
+    orientation: "landscape",
+    fitToPage: true,
+    fitToWidth: 1,
+    fitToHeight: 1,
+    scale: 100,
+    horizontalDpi: 4294967295,
+    verticalDpi: 4294967295,
+  };
+}
+
+/** 입수량·박스단위 시트 헤더 행(0-based) 감지 */
+function detectPackUnitHeaderRow(sheet) {
+  for (let excelRow = 1; excelRow <= 4; excelRow++) {
+    const aCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 0 })];
+    const bCell = sheet[XLSX.utils.encode_cell({ r: excelRow - 1, c: 1 })];
+    const aVal = String(aCell?.v ?? "").trim();
+    const bVal = String(bCell?.v ?? "").trim();
+    if (aVal.includes("제품") || bVal.includes("입수")) {
+      return excelRow - 1;
+    }
+  }
+  return 1;
+}
+
+/** 입수량·박스단위 시트 마지막 데이터 행(0-based) */
+function detectPackUnitLastDataRow(sheet, dataStartRowIdx) {
+  let last = dataStartRowIdx;
+  for (let r = dataStartRowIdx; r <= 499; r++) {
+    const aCell = sheet[XLSX.utils.encode_cell({ r, c: 0 })];
+    if (!aCell?.v || String(aCell.v).trim() === "") break;
+    last = r;
+  }
+  return last;
+}
+
+/**
+ * 입수량·박스단위 시트 전용 인쇄용 서식
+ */
+function applyPackUnitSheetStyles(sheet) {
+  const fontName = WAREHOUSE_PRINT.FONT;
+  const headerRowIdx = detectPackUnitHeaderRow(sheet);
+  const titleRowIdx = headerRowIdx > 0 ? headerRowIdx - 1 : 0;
+  const dataStartRowIdx = headerRowIdx + 1;
+  const lastDataRowIdx = detectPackUnitLastDataRow(sheet, dataStartRowIdx);
+
+  const border = {
+    top: { style: "thin", color: { rgb: "000000" } },
+    bottom: { style: "thin", color: { rgb: "000000" } },
+    left: { style: "thin", color: { rgb: "000000" } },
+    right: { style: "thin", color: { rgb: "000000" } },
+  };
+
+  const sTitle = {
+    font: { name: fontName, sz: 12, bold: true, color: { rgb: "000000" } },
+    fill: { patternType: "solid", fgColor: { rgb: "FFFFFF" } },
+    alignment: { vertical: "center", horizontal: "center" },
+  };
+  const sHead = {
+    font: { name: fontName, sz: 9, bold: true, color: { rgb: "FFFFFF" } },
+    fill: { patternType: "solid", fgColor: { rgb: "1E3A5F" } },
+    alignment: { vertical: "center", horizontal: "center", wrapText: true },
+    border,
+  };
+  const sProduct = (odd) => ({
+    font: { name: fontName, sz: 9, bold: true, color: { rgb: "000000" } },
+    fill: { patternType: "solid", fgColor: { rgb: odd ? "FFFFFF" : "F8FAFC" } },
+    alignment: { vertical: "center", horizontal: "left", indent: 1 },
+    border,
+  });
+  const sNum = (odd) => ({
+    font: { name: fontName, sz: 9, color: { rgb: "000000" } },
+    fill: { patternType: "solid", fgColor: { rgb: odd ? "FFFFFF" : "F8FAFC" } },
+    alignment: { vertical: "center", horizontal: "center" },
+    border,
+  });
+
+  let maxProductW = measureDisplayWidth("제품", 9);
+  let maxIpsurW = measureDisplayWidth("입수량", 9);
+  let maxBoxW = measureDisplayWidth("박스단위", 9);
+
+  for (let r = dataStartRowIdx; r <= lastDataRowIdx; r++) {
+    const aVal = sheet[XLSX.utils.encode_cell({ r, c: 0 })]?.v;
+    const bVal = sheet[XLSX.utils.encode_cell({ r, c: 1 })]?.v;
+    const cVal = sheet[XLSX.utils.encode_cell({ r, c: 2 })]?.v;
+    maxProductW = Math.max(maxProductW, measureDisplayWidth(aVal, 9));
+    maxIpsurW = Math.max(maxIpsurW, measureDisplayWidth(bVal, 9));
+    maxBoxW = Math.max(maxBoxW, measureDisplayWidth(cVal, 9));
+  }
+
+  sheet["!cols"] = [
+    { wch: Math.min(24, Math.max(10, maxProductW + 1)) },
+    { wch: Math.max(8, maxIpsurW + 2) },
+    { wch: Math.max(10, maxBoxW + 2) },
+  ];
+
+  if (!sheet["!rows"]) sheet["!rows"] = [];
+  sheet["!rows"][titleRowIdx] = { hpt: 22 };
+  sheet["!rows"][headerRowIdx] = { hpt: 18 };
+  for (let r = dataStartRowIdx; r <= lastDataRowIdx; r++) {
+    sheet["!rows"][r] = { hpt: 16 };
+  }
+
+  const titleAddr = XLSX.utils.encode_cell({ r: titleRowIdx, c: 0 });
+  const titleText = sheet[titleAddr]?.v
+    ? String(sheet[titleAddr].v).trim()
+    : "입수량 · 박스단위 기준표";
+  sheet[titleAddr] = { t: "s", v: titleText };
+  sheet[titleAddr].s = sTitle;
+
+  for (let c = 0; c <= 2; c++) {
+    const addr = XLSX.utils.encode_cell({ r: headerRowIdx, c });
+    ensureStyledCell(sheet, addr, { t: "s", v: ["제품", "입수량", "박스단위"][c] });
+    sheet[addr].s = sHead;
+  }
+
+  let rowNum = 0;
+  for (let r = dataStartRowIdx; r <= lastDataRowIdx; r++) {
+    const odd = rowNum % 2 === 0;
+    rowNum++;
+
+    const prodAddr = XLSX.utils.encode_cell({ r, c: 0 });
+    const ipsurAddr = XLSX.utils.encode_cell({ r, c: 1 });
+    const boxAddr = XLSX.utils.encode_cell({ r, c: 2 });
+
+    if (sheet[prodAddr]) sheet[prodAddr].s = sProduct(odd);
+    if (sheet[ipsurAddr]) {
+      sheet[ipsurAddr].s = sNum(odd);
+      if (sheet[ipsurAddr].v !== undefined && sheet[ipsurAddr].v !== "") {
+        sheet[ipsurAddr].t = "n";
+        sheet[ipsurAddr].v = Number(sheet[ipsurAddr].v) || sheet[ipsurAddr].v;
+      }
+    }
+    if (sheet[boxAddr]) {
+      sheet[boxAddr].s = sNum(odd);
+      if (sheet[boxAddr].v !== undefined && sheet[boxAddr].v !== "") {
+        sheet[boxAddr].t = "n";
+        sheet[boxAddr].v = Number(sheet[boxAddr].v) || sheet[boxAddr].v;
+      }
+    }
+  }
+
+  sheet["!merges"] = [{ s: { r: titleRowIdx, c: 0 }, e: { r: titleRowIdx, c: 2 } }];
+  sheet["!margins"] = {
+    left: 0.4,
+    right: 0.4,
+    top: 0.5,
+    bottom: 0.5,
+    header: 0.2,
+    footer: 0.2,
+  };
+  sheet["!pageSetup"] = {
+    paperSize: 9,
+    orientation: "portrait",
+    fitToPage: true,
+    fitToWidth: 1,
+    fitToHeight: 1,
+    scale: 100,
+    horizontalDpi: 4294967295,
+    verticalDpi: 4294967295,
+  };
+
+  reconcileSheetRange(sheet);
 }
 
 /**
@@ -2987,6 +3291,15 @@ function applyExcelStyles(workbook) {
       continue;
     }
 
+    if (isPackUnitSheetName(sheetName)) {
+      applyPackUnitSheetStyles(sheet);
+      continue;
+    }
+
+    if (!hasWarehouseLayout(sheet)) {
+      continue;
+    }
+
     const maxCols = detectMaxCols(sheet);
     const maxRows = detectMaxRows(sheet);
     const colMapping = detectColumnMapping(sheet, maxCols);
@@ -2995,114 +3308,113 @@ function applyExcelStyles(workbook) {
     const lastColIdx = colMapping[maxCols] || (2 * maxCols + 1);
     const rightLabelCol = lastColIdx + 1;
 
-    const colWidthMap = computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows);
-    colWidthMap[rightLabelCol] = { wch: 4 };
+    const colWidthMap = computeWarehousePrintColumnWidths(
+      sheet, colMapping, maxCols, maxRows, aisleCols, rightLabelCol
+    );
     sheet["!cols"] = buildDenseColumnWidths(colWidthMap, rightLabelCol, aisleCols);
 
     if (!sheet["!rows"]) sheet["!rows"] = [];
-    sheet["!rows"][WAREHOUSE_LAYOUT.LEGEND_ROW] = { hpt: 20 };
-    sheet["!rows"][WAREHOUSE_LAYOUT.TITLE_ROW] = { hpt: 24 };
-    sheet["!rows"][WAREHOUSE_LAYOUT.COL_NUM_ROW] = { hpt: 22 };
-    sheet["!rows"][WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW] = { hpt: 22 };
-    sheet["!rows"][WAREHOUSE_LAYOUT.PB_HEADER_ROW] = { hpt: 22 };
+    sheet["!rows"][WAREHOUSE_LAYOUT.SUBTITLE_ROW] = { hpt: WAREHOUSE_PRINT.ROW_SUBTITLE };
+    sheet["!rows"][WAREHOUSE_LAYOUT.TITLE_ROW] = { hpt: WAREHOUSE_PRINT.ROW_TITLE };
+    sheet["!rows"][WAREHOUSE_LAYOUT.COL_NUM_ROW] = { hpt: WAREHOUSE_PRINT.ROW_HEADER };
+    sheet["!rows"][WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW] = { hpt: WAREHOUSE_PRINT.ROW_HEADER };
+    sheet["!rows"][WAREHOUSE_LAYOUT.PB_HEADER_ROW] = { hpt: WAREHOUSE_PRINT.ROW_HEADER };
 
-    // !views(틀 고정)은 xlsx-js-style에서 Excel 복구 경고를 유발하므로 사용하지 않음
-
-    const fontName = "맑은 고딕";
-    const borderLight = {
-      top: { style: "thin", color: { rgb: "E2E8F0" } },
-      bottom: { style: "thin", color: { rgb: "E2E8F0" } },
-      left: { style: "thin", color: { rgb: "E2E8F0" } },
-      right: { style: "thin", color: { rgb: "E2E8F0" } },
+    const fontName = WAREHOUSE_PRINT.FONT;
+    const borderPrint = {
+      top: { style: "thin", color: { rgb: "000000" } },
+      bottom: { style: "thin", color: { rgb: "000000" } },
+      left: { style: "thin", color: { rgb: "000000" } },
+      right: { style: "thin", color: { rgb: "000000" } },
     };
-    const borderGray = {
-      top: { style: "thin", color: { rgb: "CBD5E1" } },
-      bottom: { style: "thin", color: { rgb: "CBD5E1" } },
-      left: { style: "thin", color: { rgb: "CBD5E1" } },
-      right: { style: "thin", color: { rgb: "CBD5E1" } },
+    const borderRowEnd = {
+      top: { style: "thin", color: { rgb: "000000" } },
+      bottom: { style: "medium", color: { rgb: "000000" } },
+      left: { style: "thin", color: { rgb: "000000" } },
+      right: { style: "thin", color: { rgb: "000000" } },
     };
-    const borderRackRight = {
-      top: { style: "thin", color: { rgb: "94A3B8" } },
-      bottom: { style: "thin", color: { rgb: "94A3B8" } },
-      left: { style: "thin", color: { rgb: "94A3B8" } },
-      right: { style: "medium", color: { rgb: "64748B" } },
+    const borderRackEnd = {
+      top: { style: "thin", color: { rgb: "000000" } },
+      bottom: { style: "thin", color: { rgb: "000000" } },
+      left: { style: "thin", color: { rgb: "000000" } },
+      right: { style: "medium", color: { rgb: "000000" } },
     };
 
+    const sSubtitle = {
+      font: { name: fontName, sz: 7, color: { rgb: "475569" } },
+      fill: { patternType: "solid", fgColor: { rgb: "FFFFFF" } },
+      alignment: { vertical: "center", horizontal: "center" },
+    };
     const sTitle = {
-      font: { name: fontName, sz: 13, bold: true, color: { rgb: "0F172A" } },
-      fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
-      alignment: { vertical: "center", horizontal: "left" },
-      border: borderLight,
-    };
-    const sLegend = {
-      font: { name: fontName, sz: 9, color: { rgb: "64748B" } },
-      fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
-      alignment: { vertical: "center", horizontal: "left" },
-      border: borderLight,
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_TITLE, bold: true, color: { rgb: "000000" } },
+      fill: { patternType: "solid", fgColor: { rgb: "FFFFFF" } },
+      alignment: { vertical: "center", horizontal: "center" },
     };
     const sHeaderNavy = {
-      font: { name: fontName, sz: 10, bold: true, color: { rgb: "FFFFFF" } },
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_HEADER, bold: true, color: { rgb: "FFFFFF" } },
       fill: { patternType: "solid", fgColor: { rgb: "1E3A5F" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderGray,
+      border: borderPrint,
     };
     const sProductLabel = {
-      font: { name: fontName, sz: 9, bold: true, color: { rgb: "475569" } },
+      font: { name: fontName, sz: 7, bold: true, color: { rgb: "334155" } },
       fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderGray,
+      border: borderPrint,
     };
     const sRowLabel = {
-      font: { name: fontName, sz: 10, bold: true, color: { rgb: "1E293B" } },
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_HEADER, bold: true, color: { rgb: "000000" } },
       fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderGray,
+      border: borderPrint,
     };
-    const sProductStock = {
-      font: { name: fontName, sz: 11, bold: true, color: { rgb: "FFFFFF" } },
-      fill: { patternType: "solid", fgColor: { rgb: "0F766E" } },
-      alignment: { vertical: "center", horizontal: "center", wrapText: true },
-      border: borderGray,
-    };
-    const sPalletStock = {
-      font: { name: fontName, sz: 11, bold: true, color: { rgb: "1D4ED8" } },
-      fill: { patternType: "solid", fgColor: { rgb: "DBEAFE" } },
-      alignment: { vertical: "center", horizontal: "center" },
-      border: borderGray,
-    };
-    const sBoxStock = {
-      font: { name: fontName, sz: 11, bold: true, color: { rgb: "BE123C" } },
-      fill: { patternType: "solid", fgColor: { rgb: "FFE4E6" } },
-      alignment: { vertical: "center", horizontal: "center" },
-      border: borderRackRight,
-    };
-    const sEmptyGrid = (zebra) => ({
-      font: { name: fontName, sz: 9, color: { rgb: "E2E8F0" } },
-      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F8FAFC" : "FFFFFF" } },
-      border: borderLight,
+    const sProductStock = (zebra) => ({
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_PRODUCT, bold: true, color: { rgb: "000000" } },
+      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F1F5F9" : "FFFFFF" } },
+      alignment: { vertical: "center", horizontal: "center", wrapText: false, shrinkToFit: true },
+      border: borderPrint,
     });
-    const sEmptyGridRackEnd = (zebra) => ({
-      ...sEmptyGrid(zebra),
+    const sPalletStock = (zebra) => ({
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_DATA, bold: true, color: { rgb: "1D4ED8" } },
+      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F1F5F9" : "FFFFFF" } },
+      alignment: { vertical: "center", horizontal: "center" },
+      border: borderRowEnd,
+    });
+    const sBoxStock = (zebra) => ({
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_DATA, bold: true, color: { rgb: "DC2626" } },
+      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F1F5F9" : "FFFFFF" } },
+      alignment: { vertical: "center", horizontal: "center" },
       border: {
-        top: { style: "thin", color: { rgb: "E2E8F0" } },
-        bottom: { style: "thin", color: { rgb: "E2E8F0" } },
-        left: { style: "thin", color: { rgb: "E2E8F0" } },
-        right: { style: "medium", color: { rgb: "64748B" } },
+        top: { style: "thin", color: { rgb: "000000" } },
+        bottom: { style: "medium", color: { rgb: "000000" } },
+        left: { style: "thin", color: { rgb: "000000" } },
+        right: { style: "medium", color: { rgb: "000000" } },
       },
     });
+    const sEmptyGrid = (zebra, rowEnd = false) => ({
+      font: { name: fontName, sz: 7, color: { rgb: "FFFFFF" } },
+      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F8FAFC" : "FFFFFF" } },
+      border: rowEnd ? borderRowEnd : borderPrint,
+    });
+    const sEmptyGridRackEnd = (zebra, rowEnd = false) => ({
+      ...sEmptyGrid(zebra, rowEnd),
+      border: rowEnd
+        ? { ...borderRowEnd, right: borderRackEnd.right }
+        : { ...borderPrint, right: borderRackEnd.right },
+    });
     const sAisle = {
-      font: { name: fontName, sz: 9, bold: true, color: { rgb: "64748B" } },
-      fill: { patternType: "solid", fgColor: { rgb: "E5E7EB" } },
-      alignment: { vertical: "center", horizontal: "center", wrapText: true, textRotation: 90 },
+      font: { name: fontName, sz: 7, bold: true, color: { rgb: "64748B" } },
+      fill: { patternType: "solid", fgColor: { rgb: "F1F5F9" } },
+      alignment: { vertical: "center", horizontal: "center", textRotation: 90 },
       border: {
-        top: { style: "thin", color: { rgb: "D1D5DB" } },
-        bottom: { style: "thin", color: { rgb: "D1D5DB" } },
-        left: { style: "medium", color: { rgb: "94A3B8" } },
-        right: { style: "medium", color: { rgb: "94A3B8" } },
+        top: { style: "thin", color: { rgb: "94A3B8" } },
+        bottom: { style: "thin", color: { rgb: "94A3B8" } },
+        left: { style: "medium", color: { rgb: "64748B" } },
+        right: { style: "medium", color: { rgb: "64748B" } },
       },
     };
 
-    applyWarehouseLegend(sheet, sLegend);
+    applyWarehouseTitleBlock(sheet, sheetName, { sTitle, sSubtitle });
 
     const lastDataRow = getWarehouseLastDataRow(maxRows);
     for (let colIdx of aisleCols) {
@@ -3118,8 +3430,8 @@ function applyExcelStyles(workbook) {
       const qtyRowIdx = getWarehouseQtyRowIdx(r);
       const zebra = r % 2 === 0;
 
-      if (!sheet["!rows"][prodRowIdx]) sheet["!rows"][prodRowIdx] = { hpt: 28 };
-      if (!sheet["!rows"][qtyRowIdx]) sheet["!rows"][qtyRowIdx] = { hpt: 20 };
+      if (!sheet["!rows"][prodRowIdx]) sheet["!rows"][prodRowIdx] = { hpt: WAREHOUSE_PRINT.ROW_PRODUCT };
+      if (!sheet["!rows"][qtyRowIdx]) sheet["!rows"][qtyRowIdx] = { hpt: WAREHOUSE_PRINT.ROW_QTY };
 
       const leftLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
       if (sheet[leftLabelAddr]) sheet[leftLabelAddr].s = sRowLabel;
@@ -3148,10 +3460,10 @@ function applyExcelStyles(workbook) {
         const hasStock = productVal !== "" || (Number(palletVal) || 0) > 0 || (Number(boxVal) || 0) > 0;
 
         if (hasStock) {
-          sheet[prodAddr].s = sProductStock;
-          sheet[palletAddr].s = sPalletStock;
-          sheet[boxAddr].s = sBoxStock;
-          sheet[prodBAddr].s = sEmptyGridRackEnd(zebra);
+          sheet[prodAddr].s = sProductStock(zebra);
+          sheet[palletAddr].s = sPalletStock(zebra);
+          sheet[boxAddr].s = sBoxStock(zebra);
+          sheet[prodBAddr].s = sEmptyGridRackEnd(zebra, false);
           if (sheet[palletAddr].v !== undefined && sheet[palletAddr].v !== "") {
             sheet[palletAddr].t = "n";
             sheet[palletAddr].v = Number(sheet[palletAddr].v) || 0;
@@ -3161,18 +3473,13 @@ function applyExcelStyles(workbook) {
             sheet[boxAddr].v = Number(sheet[boxAddr].v) || 0;
           }
         } else {
-          const emptyStyle = sEmptyGrid(zebra);
-          const emptyRackEnd = sEmptyGridRackEnd(zebra);
-          sheet[prodAddr].s = emptyStyle;
-          sheet[palletAddr].s = emptyStyle;
-          sheet[prodBAddr].s = emptyRackEnd;
-          sheet[boxAddr].s = emptyRackEnd;
+          sheet[prodAddr].s = sEmptyGrid(zebra, false);
+          sheet[palletAddr].s = sEmptyGrid(zebra, true);
+          sheet[prodBAddr].s = sEmptyGridRackEnd(zebra, false);
+          sheet[boxAddr].s = sEmptyGridRackEnd(zebra, true);
         }
       }
     }
-
-    const titleAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.TITLE_ROW, c: 2 });
-    if (sheet[titleAddr]) sheet[titleAddr].s = sTitle;
 
     for (let c = 1; c <= maxCols; c++) {
       const pCol = colMapping[c];
@@ -3192,6 +3499,7 @@ function applyExcelStyles(workbook) {
     }
 
     applyWarehouseMerges(sheet, { maxCols, maxRows, colMapping, aisleCols, rightLabelCol });
+    applyWarehousePrintSetup(sheet, rightLabelCol, lastDataRow);
     reconcileSheetRange(sheet);
   }
 }
