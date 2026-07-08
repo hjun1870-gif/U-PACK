@@ -134,6 +134,7 @@ const cloudSyncBtn = document.getElementById("cloudSyncBtn");
 const rackFilterGroup = document.getElementById("rackFilterGroup");
 const undoBtn = document.getElementById("undoBtn");
 const occupancyRateEl = document.getElementById("occupancyRate");
+const totalMatchEl = document.getElementById("totalMatchStatus");
 const searchNavBar = document.getElementById("searchNavBar");
 const searchPrevBtn = document.getElementById("searchPrevBtn");
 const searchNextBtn = document.getElementById("searchNextBtn");
@@ -431,6 +432,7 @@ const TOTAL_COL = {
   PANMAE: 9,
   DIFF: 10,
   LOCATION: 11,
+  CHECK: 12,
 };
 
 function uint8ArrayToBase64(bytes) {
@@ -1212,6 +1214,12 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   if (warehouseSheets.length === 0) {
     alert("창고 도면 형식의 시트를 찾을 수 없습니다. 재고조사표 양식(B1, B2 등)을 확인해 주세요.");
     return;
+  }
+
+  const totalCreated = ensureTotalSheet(workbook);
+  aggregateTotalSheet(workbook);
+  if (totalCreated) {
+    showToast("TOTAL 시트가 없어 새로 생성했습니다.", "info");
   }
 
   updateSheetDropdown(warehouseSheets);
@@ -2457,6 +2465,105 @@ function findTotalSheet(workbook) {
   return name ? workbook.Sheets[name] : null;
 }
 
+function findTotalSheetName(workbook) {
+  return workbook.SheetNames.find(
+    (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
+  ) || "TOTAL";
+}
+
+/** TOTAL 시트가 없으면 헤더 포함 새 시트 생성 */
+function ensureTotalSheet(workbook) {
+  if (findTotalSheet(workbook)) return false;
+
+  const sheet = {};
+  const headers = [
+    [TOTAL_COL.PRODUCT, "제품명"],
+    [TOTAL_COL.IPSUR, "입수량"],
+    [TOTAL_COL.BOX_UNIT, "박스단위"],
+    [TOTAL_COL.PALLET, "P"],
+    [TOTAL_COL.BOX, "B"],
+    [TOTAL_COL.JAN, "잔량(ea)"],
+    [TOTAL_COL.STOCK, "재고"],
+    [TOTAL_COL.CHULGO, "출고"],
+    [TOTAL_COL.SUM, "합계"],
+    [TOTAL_COL.PANMAE, "판매일보"],
+    [TOTAL_COL.DIFF, "차이"],
+    [TOTAL_COL.LOCATION, "창고위치"],
+    [TOTAL_COL.CHECK, "창고일치"],
+  ];
+  headers.forEach(([col, label]) => {
+    writeTotalCell(sheet, TOTAL_HEADER_ROW, col, label, "s");
+  });
+  sheet["!ref"] = `A${TOTAL_HEADER_ROW}:${XLSX.utils.encode_col(TOTAL_COL.CHECK)}${TOTAL_DATA_START_ROW - 1}`;
+  XLSX.utils.book_append_sheet(workbook, sheet, "TOTAL");
+  return true;
+}
+
+function ensureTotalCheckHeader(totalSheet) {
+  writeTotalCell(totalSheet, TOTAL_HEADER_ROW, TOTAL_COL.CHECK, "창고일치", "s");
+}
+
+function readTotalSheetQuantities(totalSheet) {
+  const data = new Map();
+  for (let excelRow = TOTAL_DATA_START_ROW; excelRow <= 300; excelRow++) {
+    const aCell = totalSheet[totalCellAddr(excelRow, TOTAL_COL.PRODUCT)];
+    if (!aCell || aCell.v === undefined || String(aCell.v).trim() === "") break;
+    const prodName = String(aCell.v).trim();
+    const readNum = (col) => {
+      const cell = totalSheet[totalCellAddr(excelRow, col)];
+      return cell?.v !== undefined ? Number(cell.v) || 0 : 0;
+    };
+    data.set(prodName, {
+      pallet: readNum(TOTAL_COL.PALLET),
+      box: readNum(TOTAL_COL.BOX),
+    });
+  }
+  return data;
+}
+
+function resolveTotalCheckLabel(originalQty, warehouseQty, hadTotalSheet) {
+  if (!hadTotalSheet) return "일치";
+  const origP = originalQty?.pallet ?? 0;
+  const origB = originalQty?.box ?? 0;
+  const whP = warehouseQty?.pallet ?? 0;
+  const whB = warehouseQty?.box ?? 0;
+  return origP === whP && origB === whB ? "일치" : "불일치";
+}
+
+function updateTotalMatchSummary(workbook) {
+  if (!totalMatchEl) return;
+  const totalSheet = findTotalSheet(workbook);
+  if (!totalSheet) {
+    totalMatchEl.textContent = "-";
+    totalMatchEl.className = "value";
+    return;
+  }
+
+  let matchCount = 0;
+  let mismatchCount = 0;
+  for (let excelRow = TOTAL_DATA_START_ROW; excelRow <= 300; excelRow++) {
+    const aCell = totalSheet[totalCellAddr(excelRow, TOTAL_COL.PRODUCT)];
+    if (!aCell || aCell.v === undefined || String(aCell.v).trim() === "") break;
+    const checkCell = totalSheet[totalCellAddr(excelRow, TOTAL_COL.CHECK)];
+    const label = checkCell?.v !== undefined ? String(checkCell.v).trim() : "";
+    if (label === "일치") matchCount += 1;
+    else if (label === "불일치") mismatchCount += 1;
+  }
+
+  if (matchCount === 0 && mismatchCount === 0) {
+    totalMatchEl.textContent = "-";
+    totalMatchEl.className = "value";
+    return;
+  }
+  if (mismatchCount > 0) {
+    totalMatchEl.textContent = `불일치 ${mismatchCount}건 / 일치 ${matchCount}건`;
+    totalMatchEl.className = "value total-match-mismatch";
+  } else {
+    totalMatchEl.textContent = `전체 일치 (${matchCount}건)`;
+    totalMatchEl.className = "value total-match-ok";
+  }
+}
+
 function totalCellAddr(excelRow, col) {
   return XLSX.utils.encode_cell({ r: excelRow - 1, c: col });
 }
@@ -2549,7 +2656,7 @@ function getTotalSheetLastDataRow(totalSheet) {
 
 function clearTotalSheetDataRows(totalSheet, fromRow, toRow) {
   for (let excelRow = fromRow; excelRow <= toRow; excelRow++) {
-    for (let col = TOTAL_COL.PRODUCT; col <= TOTAL_COL.LOCATION; col++) {
+    for (let col = TOTAL_COL.PRODUCT; col <= TOTAL_COL.CHECK; col++) {
       delete totalSheet[totalCellAddr(excelRow, col)];
     }
   }
@@ -2557,9 +2664,16 @@ function clearTotalSheetDataRows(totalSheet, fromRow, toRow) {
 
 function ensureTotalLocationHeader(totalSheet) {
   writeTotalCell(totalSheet, TOTAL_HEADER_ROW, TOTAL_COL.LOCATION, "창고위치", "s");
+  ensureTotalCheckHeader(totalSheet);
 }
 
 function aggregateTotalSheet(workbook) {
+  const hadTotalSheet = Boolean(findTotalSheet(workbook));
+  const originalQuantities = hadTotalSheet
+    ? readTotalSheetQuantities(findTotalSheet(workbook))
+    : new Map();
+
+  ensureTotalSheet(workbook);
   const totalSheet = findTotalSheet(workbook);
   if (!totalSheet) return;
 
@@ -2569,7 +2683,11 @@ function aggregateTotalSheet(workbook) {
   const preservedMeta = readTotalSheetRowMetadata(totalSheet);
   const oldLastRow = getTotalSheetLastDataRow(totalSheet);
 
-  const sortedNames = [...warehouseProducts.keys()].sort((a, b) =>
+  const allProductNames = new Set([
+    ...warehouseProducts.keys(),
+    ...originalQuantities.keys(),
+  ]);
+  const sortedNames = [...allProductNames].sort((a, b) =>
     a.localeCompare(b, "ko")
   );
 
@@ -2585,11 +2703,13 @@ function aggregateTotalSheet(workbook) {
 
   sortedNames.forEach((prodName, idx) => {
     const excelRow = TOTAL_DATA_START_ROW + idx;
-    const totals = warehouseProducts.get(prodName);
+    const totals = warehouseProducts.get(prodName) || { pallet: 0, box: 0, locations: new Set() };
     const meta = preservedMeta.get(prodName) || {};
     const locationText = [...totals.locations]
       .sort((a, b) => a.localeCompare(b, "ko"))
       .join(", ");
+    const originalQty = originalQuantities.get(prodName);
+    const checkLabel = resolveTotalCheckLabel(originalQty, totals, hadTotalSheet);
 
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.PRODUCT, prodName, "s");
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.IPSUR, meta.ipsuryang);
@@ -2600,6 +2720,7 @@ function aggregateTotalSheet(workbook) {
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.CHULGO, meta.chulgo);
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.PANMAE, meta.panmae_ilbo);
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.LOCATION, locationText, "s");
+    writeTotalCell(totalSheet, excelRow, TOTAL_COL.CHECK, checkLabel, "s");
 
     totalSheet[totalCellAddr(excelRow, TOTAL_COL.STOCK)] = {
       t: "n",
@@ -2623,13 +2744,14 @@ function aggregateTotalSheet(workbook) {
           ? TOTAL_DATA_START_ROW + sortedNames.length - 1
           : TOTAL_DATA_START_ROW - 1;
       range.e.r = Math.max(range.e.r, newLastRow - 1);
-      range.e.c = Math.max(range.e.c, TOTAL_COL.LOCATION);
+      range.e.c = Math.max(range.e.c, TOTAL_COL.CHECK);
       totalSheet["!ref"] = XLSX.utils.encode_range(range);
     } catch (e) {
       console.error("TOTAL 시트의 범위(!ref)를 갱신하는 데 실패했습니다.", e);
     }
   }
 
+  updateTotalMatchSummary(workbook);
   console.log("✅ TOTAL 시트 집계 완료:", sortedNames.length, "품목");
 }
 
@@ -2654,7 +2776,7 @@ function getAisleColumnSet(sheet) {
  * 제품명 길이에 맞춰 랙(P) 열 너비 계산
  */
 function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
-  const widths = {};
+  const widths = [];
   widths[0] = { wch: 5 };
 
   for (let c = 1; c <= maxCols; c++) {
@@ -2678,6 +2800,50 @@ function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
   return widths;
 }
 
+/** 시트에 실제 존재하는 셀 기준으로 !ref 범위를 재계산 (Excel 복구 경고 방지) */
+function reconcileSheetRange(sheet) {
+  if (!sheet) return;
+  let maxR = 0;
+  let maxC = 0;
+  let hasCells = false;
+
+  Object.keys(sheet).forEach((key) => {
+    if (key[0] === "!") return;
+    try {
+      const { r, c } = XLSX.utils.decode_cell(key);
+      maxR = Math.max(maxR, r);
+      maxC = Math.max(maxC, c);
+      hasCells = true;
+    } catch (_) {
+      /* ignore invalid keys */
+    }
+  });
+
+  if (!hasCells) return;
+
+  const range = sheet["!ref"]
+    ? XLSX.utils.decode_range(sheet["!ref"])
+    : { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+  range.e.r = Math.max(range.e.r, maxR);
+  range.e.c = Math.max(range.e.c, maxC);
+  sheet["!ref"] = XLSX.utils.encode_range(range);
+}
+
+function buildDenseColumnWidths(widthMap, lastColIdx, aisleCols) {
+  const cols = [];
+  for (let i = 0; i <= lastColIdx; i++) {
+    cols[i] = widthMap[i] || (aisleCols.has(i) ? { wch: 3 } : { wch: 4 });
+  }
+  return cols;
+}
+
+function ensureStyledCell(sheet, addr, fallback = { t: "s", v: "" }) {
+  if (!sheet[addr]) {
+    sheet[addr] = { ...fallback };
+  }
+  return sheet[addr];
+}
+
 /**
  * xlsx-js-style 라이브러리를 활용하여 다운로드 엑셀 파일에 격자 및 색상 서식을 입힙니다.
  */
@@ -2699,14 +2865,9 @@ function applyExcelStyles(workbook) {
     const lastColIdx = colMapping[maxCols] || (2 * maxCols + 1);
     const rightLabelCol = lastColIdx + 1;
 
-    const colWidths = computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows);
-    for (let i = 0; i <= rightLabelCol; i++) {
-      if (!colWidths[i]) {
-        colWidths[i] = aisleCols.has(i) ? { wch: 3 } : { wch: 4 };
-      }
-    }
-    colWidths[rightLabelCol] = { wch: 5 };
-    sheet["!cols"] = colWidths;
+    const colWidthMap = computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows);
+    colWidthMap[rightLabelCol] = { wch: 5 };
+    sheet["!cols"] = buildDenseColumnWidths(colWidthMap, rightLabelCol, aisleCols);
 
     if (!sheet["!rows"]) sheet["!rows"] = [];
     sheet["!rows"][2] = { hpt: 24 };
@@ -2714,13 +2875,7 @@ function applyExcelStyles(workbook) {
     sheet["!rows"][4] = { hpt: 18 };
     sheet["!rows"][5] = { hpt: 18 };
 
-    sheet["!views"] = [{
-      state: "frozen",
-      xSplit: 1,
-      ySplit: 6,
-      topLeftCell: "B7",
-      activeCell: "B7",
-    }];
+    // !views(틀 고정)은 xlsx-js-style에서 Excel 복구 경고를 유발하므로 사용하지 않음
 
     const fontName = "맑은 고딕";
     const borderGray = {
@@ -2784,7 +2939,7 @@ function applyExcelStyles(workbook) {
     for (let colIdx of aisleCols) {
       for (let rowIdx = 2; rowIdx <= 5 + maxRows * 2; rowIdx++) {
         const addr = XLSX.utils.encode_cell({ r: rowIdx, c: colIdx });
-        if (!sheet[addr]) sheet[addr] = { t: "s", v: "" };
+        if (!sheet[addr]) continue;
         sheet[addr].s = sAisle;
       }
     }
@@ -2802,7 +2957,7 @@ function applyExcelStyles(workbook) {
         XLSX.utils.encode_cell({ r: qtyRowIdx, c: rightLabelCol }),
       ];
       labelAddrs.forEach((addr) => {
-        if (!sheet[addr]) sheet[addr] = { t: "n", v: r };
+        if (!sheet[addr]) return;
         sheet[addr].s = sHeader;
       });
 
@@ -2815,9 +2970,9 @@ function applyExcelStyles(workbook) {
         const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pCol });
         const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: bCol });
 
-        if (!sheet[prodAddr]) sheet[prodAddr] = { t: "s", v: "" };
-        if (!sheet[palletAddr]) sheet[palletAddr] = { t: "s", v: "" };
-        if (!sheet[boxAddr]) sheet[boxAddr] = { t: "s", v: "" };
+        ensureStyledCell(sheet, prodAddr, { t: "s", v: "" });
+        ensureStyledCell(sheet, palletAddr, { t: "n", v: 0 });
+        ensureStyledCell(sheet, boxAddr, { t: "n", v: 0 });
 
         const productVal = String(sheet[prodAddr].v || "").trim();
         const palletVal = sheet[palletAddr].v;
@@ -2863,6 +3018,8 @@ function applyExcelStyles(workbook) {
       const bAddr = XLSX.utils.encode_cell({ r: 5, c: bCol });
       if (sheet[bAddr]) sheet[bAddr].s = sHeader;
     }
+
+    reconcileSheetRange(sheet);
   }
 }
 
@@ -2877,7 +3034,7 @@ function applyTotalSheetStyles(sheet) {
   const fontName = "맑은 고딕";
 
   // ── 열 너비 최적화 ──────────────────────────────────────────
-  // A:제품명, B:입수량, C:박스단위, D:P, E:B, F:잔량, G:재고, H:출고, I:합계, J:판매일보, K:차이, L:창고위치
+  // A:제품명, B:입수량, C:박스단위, D:P, E:B, F:잔량, G:재고, H:출고, I:합계, J:판매일보, K:차이, L:창고위치, M:창고일치
   sheet["!cols"] = [
     { wch: 14 }, // A: 제품명
     { wch: 8  }, // B: 입수량
@@ -2891,6 +3048,7 @@ function applyTotalSheetStyles(sheet) {
     { wch: 12 }, // J: 판매일보
     { wch: 10 }, // K: 차이
     { wch: 16 }, // L: 창고위치
+    { wch: 10 }, // M: 창고일치
   ];
 
   // ── 공통 테두리 (진한 회색) ────────────────────────────────
@@ -2950,10 +3108,24 @@ function applyTotalSheetStyles(sheet) {
     border
   });
 
-  // ── 4행 헤더 스타일 적용 (A~L 열, 인덱스 0~11) ──────────
-  for (let col = 0; col <= TOTAL_COL.LOCATION; col++) {
+  const sCheckMatch = (isOdd) => ({
+    font: { name: fontName, sz: 9, bold: true, color: { rgb: "166534" } },
+    fill: { patternType: "solid", fgColor: { rgb: isOdd ? "F0FDF4" : "DCFCE7" } },
+    alignment: { vertical: "center", horizontal: "center" },
+    border
+  });
+
+  const sCheckMismatch = (isOdd) => ({
+    font: { name: fontName, sz: 9, bold: true, color: { rgb: "B91C1C" } },
+    fill: { patternType: "solid", fgColor: { rgb: isOdd ? "FEF2F2" : "FEE2E2" } },
+    alignment: { vertical: "center", horizontal: "center" },
+    border
+  });
+
+  // ── 4행 헤더 스타일 적용 (A~M 열) ──────────
+  for (let col = 0; col <= TOTAL_COL.CHECK; col++) {
     const addr = XLSX.utils.encode_cell({ r: 3, c: col }); // 4행 = r:3
-    if (!sheet[addr]) sheet[addr] = { t: "s", v: "" };
+    if (!sheet[addr]) continue;
     sheet[addr].s = sHead;
   }
 
@@ -2980,26 +3152,30 @@ function applyTotalSheetStyles(sheet) {
       sNum(isOdd),     // J: 판매일보 (col 9)
       sNum(isOdd),     // K: 차이 (col 10)
       sLocation(isOdd), // L: 창고위치 (col 11)
+      null,             // M: 창고일치 (col 12) — 값에 따라 아래에서 개별 적용
     ];
 
     colStyles.forEach((style, colIdx) => {
+      if (colIdx === TOTAL_COL.CHECK || !style) return;
       const addr = XLSX.utils.encode_cell({ r: excelRow - 1, c: colIdx });
 
       if (sheet[addr]) {
-        // 기존 셀이 있으면 수식/값 보존, 스타일만 입힌
         sheet[addr].s = style;
-      } else if (colIdx <= 5) {
-        // A~F열(입력 데이터 영역)만: 비어있는 셀은 숫자 0으로 초기화
-        // (빈 문자열 ""로 초기화하면 수식에서 #VALUE! 발생)
-        sheet[addr] = { t: "n", v: 0, s: style };
       }
-      // G~K열(수식 영역)은 셀이 없으면 절대 새로 만들지 않음 → 수식 안전 보존
     });
+
+    const checkAddr = XLSX.utils.encode_cell({ r: excelRow - 1, c: TOTAL_COL.CHECK });
+    const checkCell = sheet[checkAddr];
+    if (checkCell) {
+      const label = String(checkCell.v || "").trim();
+      checkCell.s = label === "불일치" ? sCheckMismatch(isOdd) : sCheckMatch(isOdd);
+    }
   }
 
   // ── 행 높이 설정 ─────────────────────────────────────────
   if (!sheet["!rows"]) sheet["!rows"] = [];
   sheet["!rows"][3] = { hpt: 22 }; // 헤더 행(4행) 높이
+  reconcileSheetRange(sheet);
 }
 
 /**
