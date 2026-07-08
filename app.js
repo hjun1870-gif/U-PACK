@@ -3019,6 +3019,13 @@ const WAREHOUSE_PRINT = {
   ROW_QTY: 13,
 };
 
+const WAREHOUSE_THEME = {
+  NAVY: "1E3A5F",
+  LIGHT: "DDEBF7",
+  WHITE: "FFFFFF",
+  BLACK: "000000",
+};
+
 function getWarehouseProdRowIdx(logicalRow) {
   return WAREHOUSE_LAYOUT.DATA_START_ROW + 2 * (logicalRow - 1);
 }
@@ -3322,99 +3329,69 @@ function applyExcelStyles(workbook) {
 
     const fontName = WAREHOUSE_PRINT.FONT;
     const borderPrint = {
-      top: { style: "thin", color: { rgb: "000000" } },
-      bottom: { style: "thin", color: { rgb: "000000" } },
-      left: { style: "thin", color: { rgb: "000000" } },
-      right: { style: "thin", color: { rgb: "000000" } },
-    };
-    const borderRowEnd = {
-      top: { style: "thin", color: { rgb: "000000" } },
-      bottom: { style: "medium", color: { rgb: "000000" } },
-      left: { style: "thin", color: { rgb: "000000" } },
-      right: { style: "thin", color: { rgb: "000000" } },
-    };
-    const borderRackEnd = {
-      top: { style: "thin", color: { rgb: "000000" } },
-      bottom: { style: "thin", color: { rgb: "000000" } },
-      left: { style: "thin", color: { rgb: "000000" } },
-      right: { style: "medium", color: { rgb: "000000" } },
+      top: { style: "thin", color: { rgb: WAREHOUSE_THEME.BLACK } },
+      bottom: { style: "thin", color: { rgb: WAREHOUSE_THEME.BLACK } },
+      left: { style: "thin", color: { rgb: WAREHOUSE_THEME.BLACK } },
+      right: { style: "thin", color: { rgb: WAREHOUSE_THEME.BLACK } },
     };
 
     const sSubtitle = {
       font: { name: fontName, sz: 7, color: { rgb: "475569" } },
-      fill: { patternType: "solid", fgColor: { rgb: "FFFFFF" } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.WHITE } },
       alignment: { vertical: "center", horizontal: "center" },
     };
     const sTitle = {
-      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_TITLE, bold: true, color: { rgb: "000000" } },
-      fill: { patternType: "solid", fgColor: { rgb: "FFFFFF" } },
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_TITLE, bold: true, color: { rgb: WAREHOUSE_THEME.BLACK } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.WHITE } },
       alignment: { vertical: "center", horizontal: "center" },
     };
     const sHeaderNavy = {
-      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_HEADER, bold: true, color: { rgb: "FFFFFF" } },
-      fill: { patternType: "solid", fgColor: { rgb: "1E3A5F" } },
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_HEADER, bold: true, color: { rgb: WAREHOUSE_THEME.WHITE } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.NAVY } },
       alignment: { vertical: "center", horizontal: "center" },
       border: borderPrint,
     };
-    const sProductLabel = {
-      font: { name: fontName, sz: 7, bold: true, color: { rgb: "334155" } },
-      fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
+    const sHeaderLight = {
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_HEADER, bold: true, color: { rgb: WAREHOUSE_THEME.BLACK } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.LIGHT } },
       alignment: { vertical: "center", horizontal: "center" },
       border: borderPrint,
     };
-    const sRowLabel = {
-      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_HEADER, bold: true, color: { rgb: "000000" } },
-      fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
-      alignment: { vertical: "center", horizontal: "center" },
-      border: borderPrint,
-    };
-    const sProductStock = (zebra) => ({
-      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_PRODUCT, bold: true, color: { rgb: "000000" } },
-      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F1F5F9" : "FFFFFF" } },
+    const sProductStock = {
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_PRODUCT, bold: true, color: { rgb: WAREHOUSE_THEME.BLACK } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.WHITE } },
       alignment: { vertical: "center", horizontal: "center", wrapText: false, shrinkToFit: true },
       border: borderPrint,
-    });
-    const sPalletStock = (zebra) => ({
-      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_DATA, bold: true, color: { rgb: "1D4ED8" } },
-      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F1F5F9" : "FFFFFF" } },
+    };
+    const sQtyStock = {
+      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_DATA, color: { rgb: WAREHOUSE_THEME.BLACK } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.WHITE } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderRowEnd,
-    });
-    const sBoxStock = (zebra) => ({
-      font: { name: fontName, sz: WAREHOUSE_PRINT.FONT_DATA, bold: true, color: { rgb: "DC2626" } },
-      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F1F5F9" : "FFFFFF" } },
-      alignment: { vertical: "center", horizontal: "center" },
-      border: {
-        top: { style: "thin", color: { rgb: "000000" } },
-        bottom: { style: "medium", color: { rgb: "000000" } },
-        left: { style: "thin", color: { rgb: "000000" } },
-        right: { style: "medium", color: { rgb: "000000" } },
-      },
-    });
-    const sEmptyGrid = (zebra, rowEnd = false) => ({
-      font: { name: fontName, sz: 7, color: { rgb: "FFFFFF" } },
-      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F8FAFC" : "FFFFFF" } },
-      border: rowEnd ? borderRowEnd : borderPrint,
-    });
-    const sEmptyGridRackEnd = (zebra, rowEnd = false) => ({
-      ...sEmptyGrid(zebra, rowEnd),
-      border: rowEnd
-        ? { ...borderRowEnd, right: borderRackEnd.right }
-        : { ...borderPrint, right: borderRackEnd.right },
-    });
+      border: borderPrint,
+    };
+    const sEmptyGrid = {
+      font: { name: fontName, sz: 7, color: { rgb: WAREHOUSE_THEME.BLACK } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.WHITE } },
+      border: borderPrint,
+    };
     const sAisle = {
       font: { name: fontName, sz: 7, bold: true, color: { rgb: "64748B" } },
-      fill: { patternType: "solid", fgColor: { rgb: "F1F5F9" } },
+      fill: { patternType: "solid", fgColor: { rgb: WAREHOUSE_THEME.LIGHT } },
       alignment: { vertical: "center", horizontal: "center", textRotation: 90 },
-      border: {
-        top: { style: "thin", color: { rgb: "94A3B8" } },
-        bottom: { style: "thin", color: { rgb: "94A3B8" } },
-        left: { style: "medium", color: { rgb: "64748B" } },
-        right: { style: "medium", color: { rgb: "64748B" } },
-      },
+      border: borderPrint,
     };
 
     applyWarehouseTitleBlock(sheet, sheetName, { sTitle, sSubtitle });
+
+    const colNumCorner = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.COL_NUM_ROW, c: 0 });
+    const prodLabelCorner = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW, c: 0 });
+    const pbHeaderCorner = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PB_HEADER_ROW, c: 0 });
+    ensureStyledCell(sheet, colNumCorner, { t: "s", v: "" });
+    ensureStyledCell(sheet, prodLabelCorner, { t: "s", v: "" });
+    ensureStyledCell(sheet, pbHeaderCorner, { t: "s", v: "" });
+    sheet[colNumCorner].s = sHeaderNavy;
+    sheet[prodLabelCorner].s = sHeaderLight;
+    sheet[pbHeaderCorner].s = sHeaderNavy;
 
     const lastDataRow = getWarehouseLastDataRow(maxRows);
     for (let colIdx of aisleCols) {
@@ -3428,16 +3405,15 @@ function applyExcelStyles(workbook) {
     for (let r = 1; r <= maxRows; r++) {
       const prodRowIdx = getWarehouseProdRowIdx(r);
       const qtyRowIdx = getWarehouseQtyRowIdx(r);
-      const zebra = r % 2 === 0;
 
       if (!sheet["!rows"][prodRowIdx]) sheet["!rows"][prodRowIdx] = { hpt: WAREHOUSE_PRINT.ROW_PRODUCT };
       if (!sheet["!rows"][qtyRowIdx]) sheet["!rows"][qtyRowIdx] = { hpt: WAREHOUSE_PRINT.ROW_QTY };
 
       const leftLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
-      if (sheet[leftLabelAddr]) sheet[leftLabelAddr].s = sRowLabel;
+      if (sheet[leftLabelAddr]) sheet[leftLabelAddr].s = sHeaderLight;
 
       const rightLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: rightLabelCol });
-      if (sheet[rightLabelAddr]) sheet[rightLabelAddr].s = sRowLabel;
+      if (sheet[rightLabelAddr]) sheet[rightLabelAddr].s = sHeaderLight;
 
       for (let c = 1; c <= maxCols; c++) {
         const pCol = colMapping[c];
@@ -3459,11 +3435,12 @@ function applyExcelStyles(workbook) {
         const boxVal = sheet[boxAddr].v;
         const hasStock = productVal !== "" || (Number(palletVal) || 0) > 0 || (Number(boxVal) || 0) > 0;
 
+        sheet[prodAddr].s = hasStock ? sProductStock : sEmptyGrid;
+        sheet[palletAddr].s = hasStock ? sQtyStock : sEmptyGrid;
+        sheet[boxAddr].s = hasStock ? sQtyStock : sEmptyGrid;
+        sheet[prodBAddr].s = sEmptyGrid;
+
         if (hasStock) {
-          sheet[prodAddr].s = sProductStock(zebra);
-          sheet[palletAddr].s = sPalletStock(zebra);
-          sheet[boxAddr].s = sBoxStock(zebra);
-          sheet[prodBAddr].s = sEmptyGridRackEnd(zebra, false);
           if (sheet[palletAddr].v !== undefined && sheet[palletAddr].v !== "") {
             sheet[palletAddr].t = "n";
             sheet[palletAddr].v = Number(sheet[palletAddr].v) || 0;
@@ -3472,11 +3449,6 @@ function applyExcelStyles(workbook) {
             sheet[boxAddr].t = "n";
             sheet[boxAddr].v = Number(sheet[boxAddr].v) || 0;
           }
-        } else {
-          sheet[prodAddr].s = sEmptyGrid(zebra, false);
-          sheet[palletAddr].s = sEmptyGrid(zebra, true);
-          sheet[prodBAddr].s = sEmptyGridRackEnd(zebra, false);
-          sheet[boxAddr].s = sEmptyGridRackEnd(zebra, true);
         }
       }
     }
@@ -3490,7 +3462,7 @@ function applyExcelStyles(workbook) {
       if (sheet[colNumAddr]) sheet[colNumAddr].s = sHeaderNavy;
 
       const prodLabelAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW, c: pCol });
-      if (sheet[prodLabelAddr]) sheet[prodLabelAddr].s = sProductLabel;
+      if (sheet[prodLabelAddr]) sheet[prodLabelAddr].s = sHeaderLight;
 
       const pAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PB_HEADER_ROW, c: pCol });
       if (sheet[pAddr]) sheet[pAddr].s = sHeaderNavy;
