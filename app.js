@@ -2827,7 +2827,7 @@ function getAisleColumnSet(sheet) {
  */
 function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
   const widths = [];
-  widths[0] = { wch: 5 };
+  widths[0] = { wch: 4 };
 
   for (let c = 1; c <= maxCols; c++) {
     const pCol = colMapping[c];
@@ -2843,7 +2843,7 @@ function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
       }
     }
 
-    widths[pCol] = { wch: Math.min(22, Math.max(11, maxLen + 1)) };
+    widths[pCol] = { wch: Math.min(24, Math.max(12, maxLen + 2)) };
     widths[pCol + 1] = { wch: 7 };
   }
 
@@ -2894,6 +2894,86 @@ function ensureStyledCell(sheet, addr, fallback = { t: "s", v: "" }) {
   return sheet[addr];
 }
 
+const WAREHOUSE_LAYOUT = {
+  LEGEND_ROW: 2,
+  TITLE_ROW: 3,
+  COL_NUM_ROW: 4,
+  PRODUCT_LABEL_ROW: 5,
+  PB_HEADER_ROW: 6,
+  DATA_START_ROW: 7,
+};
+
+function getWarehouseProdRowIdx(logicalRow) {
+  return WAREHOUSE_LAYOUT.DATA_START_ROW + 2 * (logicalRow - 1);
+}
+
+function getWarehouseQtyRowIdx(logicalRow) {
+  return getWarehouseProdRowIdx(logicalRow) + 1;
+}
+
+function getWarehouseLastDataRow(maxRows) {
+  return getWarehouseQtyRowIdx(maxRows);
+}
+
+/**
+ * 창고 시트 export 전용 셀 병합 — 값은 좌상단 셀에 유지 (re-import 호환)
+ */
+function applyWarehouseMerges(sheet, { maxCols, maxRows, colMapping, aisleCols, rightLabelCol }) {
+  const merges = [];
+
+  for (let c = 1; c <= maxCols; c++) {
+    const pCol = colMapping[c];
+    if (pCol === undefined) continue;
+    const bCol = pCol + 1;
+    merges.push(
+      { s: { r: WAREHOUSE_LAYOUT.COL_NUM_ROW, c: pCol }, e: { r: WAREHOUSE_LAYOUT.COL_NUM_ROW, c: bCol } },
+      { s: { r: WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW, c: pCol }, e: { r: WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW, c: bCol } }
+    );
+  }
+
+  for (let r = 1; r <= maxRows; r++) {
+    const prodRowIdx = getWarehouseProdRowIdx(r);
+    const qtyRowIdx = getWarehouseQtyRowIdx(r);
+
+    const leftLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
+    if (sheet[leftLabelAddr]?.v !== undefined) {
+      merges.push({ s: { r: prodRowIdx, c: 0 }, e: { r: qtyRowIdx, c: 0 } });
+    }
+
+    const rightLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: rightLabelCol });
+    if (sheet[rightLabelAddr]?.v !== undefined) {
+      merges.push({ s: { r: prodRowIdx, c: rightLabelCol }, e: { r: qtyRowIdx, c: rightLabelCol } });
+    }
+  }
+
+  if (aisleCols.size > 0) {
+    const aisleArr = [...aisleCols].sort((a, b) => a - b);
+    const firstAisle = aisleArr[0];
+    const lastAisle = aisleArr[aisleArr.length - 1];
+    const lastDataRow = getWarehouseLastDataRow(maxRows);
+    const aisleAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.COL_NUM_ROW, c: firstAisle });
+    ensureStyledCell(sheet, aisleAddr, { t: "s", v: "통로" });
+    merges.push({
+      s: { r: WAREHOUSE_LAYOUT.COL_NUM_ROW, c: firstAisle },
+      e: { r: lastDataRow, c: lastAisle },
+    });
+  }
+
+  const legendEndCol = Math.min(rightLabelCol, 12);
+  merges.push({
+    s: { r: WAREHOUSE_LAYOUT.LEGEND_ROW, c: 2 },
+    e: { r: WAREHOUSE_LAYOUT.LEGEND_ROW, c: legendEndCol },
+  });
+
+  sheet["!merges"] = merges;
+}
+
+function applyWarehouseLegend(sheet, sLegend) {
+  const addr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.LEGEND_ROW, c: 2 });
+  sheet[addr] = { t: "s", v: "P = 파렛트  |  B = 박스  |  ■ = 재고 있음" };
+  sheet[addr].s = sLegend;
+}
+
 /**
  * xlsx-js-style 라이브러리를 활용하여 다운로드 엑셀 파일에 격자 및 색상 서식을 입힙니다.
  */
@@ -2916,25 +2996,32 @@ function applyExcelStyles(workbook) {
     const rightLabelCol = lastColIdx + 1;
 
     const colWidthMap = computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows);
-    colWidthMap[rightLabelCol] = { wch: 5 };
+    colWidthMap[rightLabelCol] = { wch: 4 };
     sheet["!cols"] = buildDenseColumnWidths(colWidthMap, rightLabelCol, aisleCols);
 
     if (!sheet["!rows"]) sheet["!rows"] = [];
-    sheet["!rows"][2] = { hpt: 24 };
-    sheet["!rows"][3] = { hpt: 20 };
-    sheet["!rows"][4] = { hpt: 18 };
-    sheet["!rows"][5] = { hpt: 18 };
+    sheet["!rows"][WAREHOUSE_LAYOUT.LEGEND_ROW] = { hpt: 20 };
+    sheet["!rows"][WAREHOUSE_LAYOUT.TITLE_ROW] = { hpt: 24 };
+    sheet["!rows"][WAREHOUSE_LAYOUT.COL_NUM_ROW] = { hpt: 22 };
+    sheet["!rows"][WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW] = { hpt: 22 };
+    sheet["!rows"][WAREHOUSE_LAYOUT.PB_HEADER_ROW] = { hpt: 22 };
 
     // !views(틀 고정)은 xlsx-js-style에서 Excel 복구 경고를 유발하므로 사용하지 않음
 
     const fontName = "맑은 고딕";
+    const borderLight = {
+      top: { style: "thin", color: { rgb: "E2E8F0" } },
+      bottom: { style: "thin", color: { rgb: "E2E8F0" } },
+      left: { style: "thin", color: { rgb: "E2E8F0" } },
+      right: { style: "thin", color: { rgb: "E2E8F0" } },
+    };
     const borderGray = {
       top: { style: "thin", color: { rgb: "CBD5E1" } },
       bottom: { style: "thin", color: { rgb: "CBD5E1" } },
       left: { style: "thin", color: { rgb: "CBD5E1" } },
       right: { style: "thin", color: { rgb: "CBD5E1" } },
     };
-    const borderRack = {
+    const borderRackRight = {
       top: { style: "thin", color: { rgb: "94A3B8" } },
       bottom: { style: "thin", color: { rgb: "94A3B8" } },
       left: { style: "thin", color: { rgb: "94A3B8" } },
@@ -2942,74 +3029,103 @@ function applyExcelStyles(workbook) {
     };
 
     const sTitle = {
-      font: { name: fontName, sz: 12, bold: true, color: { rgb: "0F172A" } },
+      font: { name: fontName, sz: 13, bold: true, color: { rgb: "0F172A" } },
       fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
+      alignment: { vertical: "center", horizontal: "left" },
+      border: borderLight,
+    };
+    const sLegend = {
+      font: { name: fontName, sz: 9, color: { rgb: "64748B" } },
+      fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
+      alignment: { vertical: "center", horizontal: "left" },
+      border: borderLight,
+    };
+    const sHeaderNavy = {
+      font: { name: fontName, sz: 10, bold: true, color: { rgb: "FFFFFF" } },
+      fill: { patternType: "solid", fgColor: { rgb: "1E3A5F" } },
       alignment: { vertical: "center", horizontal: "center" },
       border: borderGray,
     };
-    const sHeader = {
+    const sProductLabel = {
+      font: { name: fontName, sz: 9, bold: true, color: { rgb: "475569" } },
+      fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
+      alignment: { vertical: "center", horizontal: "center" },
+      border: borderGray,
+    };
+    const sRowLabel = {
       font: { name: fontName, sz: 10, bold: true, color: { rgb: "1E293B" } },
       fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
       alignment: { vertical: "center", horizontal: "center" },
       border: borderGray,
     };
-    const sProduct = {
-      font: { name: fontName, sz: 10, bold: true, color: { rgb: "14532D" } },
-      fill: { patternType: "solid", fgColor: { rgb: "DCFCE7" } },
+    const sProductStock = {
+      font: { name: fontName, sz: 11, bold: true, color: { rgb: "FFFFFF" } },
+      fill: { patternType: "solid", fgColor: { rgb: "0F766E" } },
       alignment: { vertical: "center", horizontal: "center", wrapText: true },
       border: borderGray,
     };
-    const sPallet = {
-      font: { name: fontName, sz: 10, bold: true, color: { rgb: "1D4ED8" } },
+    const sPalletStock = {
+      font: { name: fontName, sz: 11, bold: true, color: { rgb: "1D4ED8" } },
       fill: { patternType: "solid", fgColor: { rgb: "DBEAFE" } },
       alignment: { vertical: "center", horizontal: "center" },
       border: borderGray,
     };
-    const sBox = {
-      font: { name: fontName, sz: 10, bold: true, color: { rgb: "BE123C" } },
+    const sBoxStock = {
+      font: { name: fontName, sz: 11, bold: true, color: { rgb: "BE123C" } },
       fill: { patternType: "solid", fgColor: { rgb: "FFE4E6" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderRack,
+      border: borderRackRight,
     };
-    const sEmptyGrid = {
-      font: { name: fontName, sz: 9, color: { rgb: "CBD5E1" } },
-      fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
-      border: borderGray,
-    };
+    const sEmptyGrid = (zebra) => ({
+      font: { name: fontName, sz: 9, color: { rgb: "E2E8F0" } },
+      fill: { patternType: "solid", fgColor: { rgb: zebra ? "F8FAFC" : "FFFFFF" } },
+      border: borderLight,
+    });
+    const sEmptyGridRackEnd = (zebra) => ({
+      ...sEmptyGrid(zebra),
+      border: {
+        top: { style: "thin", color: { rgb: "E2E8F0" } },
+        bottom: { style: "thin", color: { rgb: "E2E8F0" } },
+        left: { style: "thin", color: { rgb: "E2E8F0" } },
+        right: { style: "medium", color: { rgb: "64748B" } },
+      },
+    });
     const sAisle = {
+      font: { name: fontName, sz: 9, bold: true, color: { rgb: "64748B" } },
       fill: { patternType: "solid", fgColor: { rgb: "E5E7EB" } },
+      alignment: { vertical: "center", horizontal: "center", wrapText: true, textRotation: 90 },
       border: {
         top: { style: "thin", color: { rgb: "D1D5DB" } },
         bottom: { style: "thin", color: { rgb: "D1D5DB" } },
-        left: { style: "thin", color: { rgb: "D1D5DB" } },
-        right: { style: "thin", color: { rgb: "D1D5DB" } },
+        left: { style: "medium", color: { rgb: "94A3B8" } },
+        right: { style: "medium", color: { rgb: "94A3B8" } },
       },
     };
 
+    applyWarehouseLegend(sheet, sLegend);
+
+    const lastDataRow = getWarehouseLastDataRow(maxRows);
     for (let colIdx of aisleCols) {
-      for (let rowIdx = 2; rowIdx <= 5 + maxRows * 2; rowIdx++) {
+      for (let rowIdx = WAREHOUSE_LAYOUT.COL_NUM_ROW; rowIdx <= lastDataRow; rowIdx++) {
         const addr = XLSX.utils.encode_cell({ r: rowIdx, c: colIdx });
-        if (!sheet[addr]) continue;
+        ensureStyledCell(sheet, addr, { t: "s", v: "" });
         sheet[addr].s = sAisle;
       }
     }
 
     for (let r = 1; r <= maxRows; r++) {
-      const prodRowIdx = 7 + 2 * (r - 1);
-      const qtyRowIdx = 8 + 2 * (r - 1);
-      if (!sheet["!rows"][prodRowIdx]) sheet["!rows"][prodRowIdx] = { hpt: 24 };
-      if (!sheet["!rows"][qtyRowIdx]) sheet["!rows"][qtyRowIdx] = { hpt: 18 };
+      const prodRowIdx = getWarehouseProdRowIdx(r);
+      const qtyRowIdx = getWarehouseQtyRowIdx(r);
+      const zebra = r % 2 === 0;
 
-      const labelAddrs = [
-        XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 }),
-        XLSX.utils.encode_cell({ r: qtyRowIdx, c: 0 }),
-        XLSX.utils.encode_cell({ r: prodRowIdx, c: rightLabelCol }),
-        XLSX.utils.encode_cell({ r: qtyRowIdx, c: rightLabelCol }),
-      ];
-      labelAddrs.forEach((addr) => {
-        if (!sheet[addr]) return;
-        sheet[addr].s = sHeader;
-      });
+      if (!sheet["!rows"][prodRowIdx]) sheet["!rows"][prodRowIdx] = { hpt: 28 };
+      if (!sheet["!rows"][qtyRowIdx]) sheet["!rows"][qtyRowIdx] = { hpt: 20 };
+
+      const leftLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
+      if (sheet[leftLabelAddr]) sheet[leftLabelAddr].s = sRowLabel;
+
+      const rightLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: rightLabelCol });
+      if (sheet[rightLabelAddr]) sheet[rightLabelAddr].s = sRowLabel;
 
       for (let c = 1; c <= maxCols; c++) {
         const pCol = colMapping[c];
@@ -3017,10 +3133,12 @@ function applyExcelStyles(workbook) {
         const bCol = pCol + 1;
 
         const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pCol });
+        const prodBAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: bCol });
         const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pCol });
         const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: bCol });
 
         ensureStyledCell(sheet, prodAddr, { t: "s", v: "" });
+        ensureStyledCell(sheet, prodBAddr, { t: "s", v: "" });
         ensureStyledCell(sheet, palletAddr, { t: "n", v: 0 });
         ensureStyledCell(sheet, boxAddr, { t: "n", v: 0 });
 
@@ -3030,9 +3148,10 @@ function applyExcelStyles(workbook) {
         const hasStock = productVal !== "" || (Number(palletVal) || 0) > 0 || (Number(boxVal) || 0) > 0;
 
         if (hasStock) {
-          sheet[prodAddr].s = sProduct;
-          sheet[palletAddr].s = sPallet;
-          sheet[boxAddr].s = sBox;
+          sheet[prodAddr].s = sProductStock;
+          sheet[palletAddr].s = sPalletStock;
+          sheet[boxAddr].s = sBoxStock;
+          sheet[prodBAddr].s = sEmptyGridRackEnd(zebra);
           if (sheet[palletAddr].v !== undefined && sheet[palletAddr].v !== "") {
             sheet[palletAddr].t = "n";
             sheet[palletAddr].v = Number(sheet[palletAddr].v) || 0;
@@ -3042,14 +3161,17 @@ function applyExcelStyles(workbook) {
             sheet[boxAddr].v = Number(sheet[boxAddr].v) || 0;
           }
         } else {
-          sheet[prodAddr].s = sEmptyGrid;
-          sheet[palletAddr].s = sEmptyGrid;
-          sheet[boxAddr].s = sEmptyGrid;
+          const emptyStyle = sEmptyGrid(zebra);
+          const emptyRackEnd = sEmptyGridRackEnd(zebra);
+          sheet[prodAddr].s = emptyStyle;
+          sheet[palletAddr].s = emptyStyle;
+          sheet[prodBAddr].s = emptyRackEnd;
+          sheet[boxAddr].s = emptyRackEnd;
         }
       }
     }
 
-    const titleAddr = XLSX.utils.encode_cell({ r: 2, c: 2 });
+    const titleAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.TITLE_ROW, c: 2 });
     if (sheet[titleAddr]) sheet[titleAddr].s = sTitle;
 
     for (let c = 1; c <= maxCols; c++) {
@@ -3057,18 +3179,19 @@ function applyExcelStyles(workbook) {
       if (pCol === undefined) continue;
       const bCol = pCol + 1;
 
-      const colNumAddr = XLSX.utils.encode_cell({ r: 3, c: pCol });
-      if (sheet[colNumAddr]) sheet[colNumAddr].s = sHeader;
+      const colNumAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.COL_NUM_ROW, c: pCol });
+      if (sheet[colNumAddr]) sheet[colNumAddr].s = sHeaderNavy;
 
-      const prodLabelAddr = XLSX.utils.encode_cell({ r: 4, c: pCol });
-      if (sheet[prodLabelAddr]) sheet[prodLabelAddr].s = sHeader;
+      const prodLabelAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PRODUCT_LABEL_ROW, c: pCol });
+      if (sheet[prodLabelAddr]) sheet[prodLabelAddr].s = sProductLabel;
 
-      const pAddr = XLSX.utils.encode_cell({ r: 5, c: pCol });
-      if (sheet[pAddr]) sheet[pAddr].s = sHeader;
-      const bAddr = XLSX.utils.encode_cell({ r: 5, c: bCol });
-      if (sheet[bAddr]) sheet[bAddr].s = sHeader;
+      const pAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PB_HEADER_ROW, c: pCol });
+      if (sheet[pAddr]) sheet[pAddr].s = sHeaderNavy;
+      const bAddr = XLSX.utils.encode_cell({ r: WAREHOUSE_LAYOUT.PB_HEADER_ROW, c: bCol });
+      if (sheet[bAddr]) sheet[bAddr].s = sHeaderNavy;
     }
 
+    applyWarehouseMerges(sheet, { maxCols, maxRows, colMapping, aisleCols, rightLabelCol });
     reconcileSheetRange(sheet);
   }
 }
