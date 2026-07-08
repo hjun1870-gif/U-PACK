@@ -884,28 +884,36 @@ function loadOptionalConfigScript() {
 function updateSyncDiagnostics(inventoryCount, hasWorkbookArchive, templateSource, dbSheetNames = [], wbSheetNames = []) {
   const el = document.getElementById("syncDiagnostics");
   if (!el) return;
+  el.classList.remove("is-warning", "is-ok");
+
+  const renderChips = (items) => {
+    el.innerHTML = items.map((text) => `<span class="sync-diag-chip">${text}</span>`).join("");
+  };
+
   if (!isOnline) {
-    el.textContent = "DB 미연결 — ⚙️ DB 설정에서 Supabase URL·Key를 입력하세요.";
+    renderChips(["DB 미연결", "⚙️ DB 설정에서 Supabase URL·Key를 입력하세요"]);
+    el.classList.add("is-warning");
     return;
   }
+
   const dbLabel = dbSheetNames.length ? dbSheetNames.slice(0, 4).join(", ") : "-";
   const wbLabel = wbSheetNames.length ? wbSheetNames.slice(0, 4).join(", ") : "-";
   const parts = [
     `DB 재고 ${inventoryCount}건`,
     hasWorkbookArchive ? "업로드 엑셀 ✓" : "업로드 엑셀 ✗",
-    `DB시트: ${dbLabel}`,
-    `도면: ${wbLabel}`,
+    `DB시트 ${dbLabel}`,
+    `도면 ${wbLabel}`,
   ];
-  el.textContent = parts.join(" · ");
+
   if (!hasWorkbookArchive && dbSheetNames.length > 0 && templateSource === "bundled") {
-    el.textContent += " — ⚠️ PC에서 엑셀 재업로드 필요 (시트 불일치)";
-    el.style.color = "#fbbf24";
+    parts.push("⚠️ PC에서 엑셀 재업로드 필요");
+    el.classList.add("is-warning");
   } else if (templateSource === "db-layout" || templateSource === "db-generated") {
-    el.textContent += " — DB 도면 복원";
-    el.style.color = "#10b981";
-  } else {
-    el.style.color = "var(--text-muted)";
+    parts.push("DB 도면 복원");
+    el.classList.add("is-ok");
   }
+
+  renderChips(parts);
 }
 
 /**
@@ -2594,15 +2602,15 @@ function updateTotalMatchSummary(workbook) {
 
   if (matchCount === 0 && mismatchCount === 0) {
     totalMatchEl.textContent = "-";
-    totalMatchEl.className = "value";
+    totalMatchEl.className = "summary-value";
     return;
   }
   if (mismatchCount > 0) {
     totalMatchEl.textContent = `불일치 ${mismatchCount}건 / 일치 ${matchCount}건`;
-    totalMatchEl.className = "value total-match-mismatch";
+    totalMatchEl.className = "summary-value total-match-mismatch";
   } else {
     totalMatchEl.textContent = `전체 일치 (${matchCount}건)`;
-    totalMatchEl.className = "value total-match-ok";
+    totalMatchEl.className = "summary-value total-match-ok";
   }
 }
 

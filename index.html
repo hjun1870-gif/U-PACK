@@ -11,7 +11,7 @@
   <meta name="description" content="엑셀 기반의 창고 재고 데이터를 시각적인 랙(Rack) 레이아웃으로 변환하고 직관적으로 수정을 돕는 웹 애플리케이션입니다.">
   
   <!-- 디자인 스타일시트 연결 -->
-  <link rel="stylesheet" href="styles.css?v=20260708n">
+  <link rel="stylesheet" href="styles.css?v=20260708p">
   
   <!-- 외부 엑셀 파싱 및 스타일 라이브러리 (xlsx-js-style) CDN 로드 -->
   <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
@@ -90,32 +90,34 @@
 
     <!-- 요약 통계 정보 표시 바 -->
     <div class="summary-bar">
-      <div class="summary-item">
-        <span class="label">적재 품목 수:</span>
-        <span id="totalProducts" class="value">0</span>
+      <div class="summary-stats">
+        <div class="summary-card">
+          <span class="summary-label">적재 품목</span>
+          <span id="totalProducts" class="summary-value">0</span>
+        </div>
+        <div class="summary-card">
+          <span class="summary-label">파렛트 (P)</span>
+          <span id="totalPallets" class="summary-value">0</span>
+        </div>
+        <div class="summary-card">
+          <span class="summary-label">박스 (B)</span>
+          <span id="totalBoxes" class="summary-value">0</span>
+        </div>
+        <div class="summary-card summary-card-wide">
+          <span class="summary-label">도면 규격</span>
+          <span id="layoutInfo" class="summary-value summary-value-text">-</span>
+        </div>
+        <div class="summary-card">
+          <span class="summary-label">구역 점유</span>
+          <span id="occupancyRate" class="summary-value">0</span>
+        </div>
+        <div class="summary-card">
+          <span class="summary-label">TOTAL ↔ 창고</span>
+          <span id="totalMatchStatus" class="summary-value">-</span>
+        </div>
       </div>
-      <div class="summary-item">
-        <span class="label">총 파렛트(P) 수량:</span>
-        <span id="totalPallets" class="value">0</span>
-      </div>
-      <div class="summary-item">
-        <span class="label">총 박스(B) 수량:</span>
-        <span id="totalBoxes" class="value">0</span>
-      </div>
-      <div class="summary-item">
-        <span class="label">도면 규격:</span>
-        <span id="layoutInfo" class="value">-</span>
-      </div>
-      <div class="summary-item">
-        <span class="label">구역 점유율:</span>
-        <span id="occupancyRate" class="value">-</span>
-      </div>
-      <div class="summary-item">
-        <span class="label">TOTAL↔창고:</span>
-        <span id="totalMatchStatus" class="value">-</span>
-      </div>
-      <div class="summary-item sync-diagnostics-item" style="flex: 1 1 100%;">
-        <span id="syncDiagnostics" class="label" style="color: var(--text-muted); font-size: 0.8rem;">DB 연결 상태 확인 중...</span>
+      <div id="syncDiagnostics" class="summary-diagnostics" aria-live="polite">
+        <span class="sync-diag-chip">DB 연결 상태 확인 중...</span>
       </div>
     </div>
 
@@ -294,6 +296,6 @@
   <!-- Supabase JS 라이브러리 CDN 로드 및 연동 설정 파일 로드 -->
   <script src="config.js" onerror="void 0"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="app.js?v=20260708o" defer></script>
+  <script src="app.js?v=20260708p" defer></script>
 </body>
 </html>
