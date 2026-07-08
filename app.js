@@ -8,6 +8,8 @@
 
 // 애플리케이션 상태 관리 전역 변수
 let currentWorkbook = null; // 로드된 전체 엑셀 워크북 객체
+let productCatalogCache = [];
+let autocompleteActiveIndex = -1;
 let currentSheetName = "";  // 현재 화면에 렌더링 중인 시트 이름
 let currentSheetData = null; // 현재 시트의 파싱된 엑셀 데이터 객체
 let selectedCellInfo = null; // 현재 편집 모달이 열려 있는 셀의 정보
@@ -93,6 +95,7 @@ const fileInput = document.getElementById("fileInput");
 const demoBtn = document.getElementById("demoBtn");
 const sheetSelect = document.getElementById("sheetSelect");
 const searchInput = document.getElementById("searchInput");
+const searchAutocomplete = document.getElementById("searchAutocomplete");
 const searchResults = document.getElementById("searchResults");     // 결과 목록 패널
 const searchResultsWrap = document.getElementById("searchResultsWrap"); // 래퍼: 이것을 show/hide하여 창고 도면을 밀어냄
 const exportBtn = document.getElementById("exportBtn");
@@ -128,6 +131,271 @@ const syncStatusEl = document.getElementById("syncStatus");
 const mobileScrollHint = document.getElementById("mobileScrollHint");
 const autoSyncOnUploadInput = document.getElementById("autoSyncOnUpload");
 const cloudSyncBtn = document.getElementById("cloudSyncBtn");
+const rackFilterGroup = document.getElementById("rackFilterGroup");
+const undoBtn = document.getElementById("undoBtn");
+const occupancyRateEl = document.getElementById("occupancyRate");
+const searchNavBar = document.getElementById("searchNavBar");
+const searchPrevBtn = document.getElementById("searchPrevBtn");
+const searchNextBtn = document.getElementById("searchNextBtn");
+const searchNavLabel = document.getElementById("searchNavLabel");
+const moveBtn = document.getElementById("moveBtn");
+const moveModal = document.getElementById("moveModal");
+const closeMoveModal = document.getElementById("closeMoveModal");
+const cancelMoveBtn = document.getElementById("cancelMoveBtn");
+const confirmMoveBtn = document.getElementById("confirmMoveBtn");
+const moveSheetSelect = document.getElementById("moveSheetSelect");
+const moveRowInput = document.getElementById("moveRow");
+const moveColInput = document.getElementById("moveCol");
+const toastContainer = document.getElementById("toastContainer");
+
+let rackDisplayFilter = "all";
+let lastSearchMatches = [];
+let lastSearchMatchIndex = -1;
+let lastUndoSnapshot = null;
+let syncFailedState = false;
+let globalLoadingCount = 0;
+
+function showToast(message, type = "info", duration = 3000) {
+  if (!toastContainer) return;
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  toastContainer.appendChild(toast);
+  setTimeout(() => {
+    toast.style.opacity = "0";
+    toast.style.transition = "opacity 0.3s";
+    setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+
+function setGlobalLoading(loading, statusText) {
+  if (loading) {
+    globalLoadingCount += 1;
+  } else {
+    globalLoadingCount = Math.max(0, globalLoadingCount - 1);
+  }
+  const busy = globalLoadingCount > 0;
+  document.body.classList.toggle("is-loading", busy);
+  [exportBtn, cloudSyncBtn, demoBtn].forEach((btn) => {
+    if (btn) btn.disabled = busy;
+  });
+  const uploadBtn = document.querySelector(".file-upload-btn");
+  if (uploadBtn) uploadBtn.disabled = busy;
+  if (statusText && syncStatusEl && busy) {
+    syncStatusEl.textContent = statusText;
+  }
+}
+
+function markSyncFailed(message) {
+  syncFailedState = true;
+  if (!syncStatusEl) return;
+  syncStatusEl.textContent = message || "🔴 동기화 실패 — 클릭하여 재시도";
+  syncStatusEl.classList.add("sync-failed");
+  syncStatusEl.title = "클릭하여 동기화 재시도";
+}
+
+function clearSyncFailed() {
+  syncFailedState = false;
+  if (syncStatusEl) {
+    syncStatusEl.classList.remove("sync-failed");
+    syncStatusEl.title = "";
+  }
+}
+
+function buildDuplicateProductMap() {
+  const counts = new Map();
+  if (!currentWorkbook) return counts;
+  getWarehouseSheetNames(currentWorkbook).forEach((sheetName) => {
+    const sheet = currentWorkbook.Sheets[sheetName];
+    if (!sheet) return;
+    const maxCols = detectMaxCols(sheet);
+    const maxRows = detectMaxRows(sheet);
+    const colMapping = detectColumnMapping(sheet);
+    for (let r = 1; r <= maxRows; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      const qtyRowIdx = 8 + 2 * (r - 1);
+      for (let c = 1; c <= maxCols; c++) {
+        const data = getRackCellData(sheet, colMapping, r, c, prodRowIdx, qtyRowIdx);
+        if (!data.product) continue;
+        const key = data.product.toLowerCase();
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+    }
+  });
+  return counts;
+}
+
+function applyRackFilterToCell(cell, cellData) {
+  const hasStock = Boolean(cellData.product || cellData.pallet > 0 || cellData.box > 0);
+  cell.classList.toggle("rack-filter-hidden", (
+    (rackDisplayFilter === "stocked" && !hasStock) ||
+    (rackDisplayFilter === "empty" && hasStock)
+  ));
+}
+
+function updateUndoButtonVisibility() {
+  if (undoBtn) undoBtn.style.display = lastUndoSnapshot ? "inline-block" : "none";
+}
+
+function saveUndoSnapshot() {
+  if (!selectedCellInfo || !currentSheetName) return;
+  lastUndoSnapshot = {
+    sheetName: currentSheetName,
+    row: selectedCellInfo.row,
+    col: selectedCellInfo.col,
+    product: selectedCellInfo.data.product || "",
+    pallet: selectedCellInfo.data.pallet || 0,
+    box: selectedCellInfo.data.box || 0,
+  };
+  updateUndoButtonVisibility();
+}
+
+async function performUndo() {
+  if (!lastUndoSnapshot || !currentWorkbook) return;
+  const snap = lastUndoSnapshot;
+  const sheet = currentWorkbook.Sheets[snap.sheetName];
+  if (!sheet) {
+    showToast("되돌릴 시트를 찾을 수 없습니다.", "error");
+    return;
+  }
+  if (snap.sheetName !== currentSheetName) {
+    sheetSelect.value = snap.sheetName;
+    renderActiveSheet(snap.sheetName);
+  }
+  const colMapping = detectColumnMapping(sheet);
+  const prodRowIdx = 7 + 2 * (snap.row - 1);
+  const qtyRowIdx = 8 + 2 * (snap.row - 1);
+  const cellData = getRackCellData(sheet, colMapping, snap.row, snap.col, prodRowIdx, qtyRowIdx);
+  selectedCellInfo = { row: snap.row, col: snap.col, data: cellData };
+  lastUndoSnapshot = null;
+  updateUndoButtonVisibility();
+  await applyCellChanges(snap.product, snap.pallet, snap.box, { skipUndo: true });
+  showToast("마지막 편집을 되돌렸습니다.", "success");
+}
+
+function focusSearchMatchAt(index) {
+  if (!lastSearchMatches.length) return;
+  const safeIndex = ((index % lastSearchMatches.length) + lastSearchMatches.length) % lastSearchMatches.length;
+  lastSearchMatchIndex = safeIndex;
+  const match = lastSearchMatches[safeIndex];
+  if (searchNavLabel) {
+    searchNavLabel.textContent = `${safeIndex + 1} / ${lastSearchMatches.length}`;
+  }
+  if (currentSheetName !== match.sheetName) {
+    sheetSelect.value = match.sheetName;
+    renderActiveSheet(match.sheetName);
+  }
+  searchInput.value = match.product;
+  handleSearchInput();
+  const targetCell = gridBoard.querySelector(`.rack-cell[data-row="${match.row}"][data-col="${match.col}"]`);
+  if (targetCell) {
+    targetCell.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+    targetCell.classList.add("search-highlight");
+    setTimeout(() => targetCell.classList.remove("search-highlight"), 2500);
+  }
+}
+
+function updateSearchNavBar() {
+  if (!searchNavBar) return;
+  const show = lastSearchMatches.length > 0 && searchInput.value.trim() !== "";
+  searchNavBar.style.display = show ? "flex" : "none";
+  if (searchPrevBtn) searchPrevBtn.disabled = !show;
+  if (searchNextBtn) searchNextBtn.disabled = !show;
+  if (searchNavLabel && show) {
+    searchNavLabel.textContent = `${Math.max(0, lastSearchMatchIndex) + 1} / ${lastSearchMatches.length}`;
+  }
+}
+
+function showMoveModal() {
+  if (!selectedCellInfo || !currentWorkbook) return;
+  const hasData = Boolean(selectedCellInfo.data.product || selectedCellInfo.data.pallet || selectedCellInfo.data.box);
+  if (!hasData) {
+    showToast("이동할 재고가 없습니다.", "warning");
+    return;
+  }
+  const sheets = getWarehouseSheetNames(currentWorkbook);
+  moveSheetSelect.innerHTML = sheets.map((n) => `<option value="${n}">${n}</option>`).join("");
+  moveSheetSelect.value = currentSheetName;
+  moveRowInput.value = selectedCellInfo.row;
+  moveColInput.value = selectedCellInfo.col;
+  moveModal.classList.add("show");
+  document.body.classList.add("modal-open");
+}
+
+function hideMoveModal() {
+  moveModal.classList.remove("show");
+  if (!editModal.classList.contains("show") && !dbConfigModal.classList.contains("show")) {
+    document.body.classList.remove("modal-open");
+  }
+}
+
+async function confirmMoveStock() {
+  if (!selectedCellInfo || !currentWorkbook) return;
+  const srcSheet = currentSheetName;
+  const srcRow = selectedCellInfo.row;
+  const srcCol = selectedCellInfo.col;
+  const product = inputProduct.value.trim() || selectedCellInfo.data.product;
+  const pallet = parseInt(inputPallet.value, 10) || 0;
+  const box = parseInt(inputBox.value, 10) || 0;
+  const destSheet = moveSheetSelect.value;
+  const destRow = parseInt(moveRowInput.value, 10);
+  const destCol = parseInt(moveColInput.value, 10);
+
+  if (!destSheet || !destRow || !destCol) {
+    showToast("이동 대상 위치를 입력해 주세요.", "warning");
+    return;
+  }
+  if (srcSheet === destSheet && srcRow === destRow && srcCol === destCol) {
+    showToast("같은 위치로는 이동할 수 없습니다.", "warning");
+    return;
+  }
+
+  saveUndoSnapshot();
+  const destSheetObj = currentWorkbook.Sheets[destSheet];
+  if (!destSheetObj) {
+    showToast("대상 구역을 찾을 수 없습니다.", "error");
+    return;
+  }
+  const destMapping = detectColumnMapping(destSheetObj);
+  const destProdRowIdx = 7 + 2 * (destRow - 1);
+  const destQtyRowIdx = 8 + 2 * (destRow - 1);
+  const destData = getRackCellData(destSheetObj, destMapping, destRow, destCol, destProdRowIdx, destQtyRowIdx);
+
+  updateExcelCellValue(destSheetObj, destData.prodCellAddress, product, "s");
+  updateExcelCellValue(destSheetObj, destData.palletCellAddress, pallet, "n");
+  updateExcelCellValue(destSheetObj, destData.boxCellAddress, box, "n");
+
+  if (isOnline && supabaseClient) {
+    try {
+      await supabaseClient.from("rack_inventory").upsert({
+        sheet_name: destSheet,
+        rack_row: destRow,
+        rack_col: destCol,
+        product_name: product,
+        pallet_qty: pallet,
+        box_qty: box,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "sheet_name,rack_row,rack_col" });
+    } catch (e) {
+      showToast("대상 위치 서버 동기화 실패 (로컬만 반영)", "warning");
+    }
+  }
+
+  selectedCellInfo = { row: srcRow, col: srcCol, data: selectedCellInfo.data };
+  currentSheetData = currentWorkbook.Sheets[srcSheet];
+  await applyCellChanges("", 0, 0, { skipUndo: true });
+
+  sheetSelect.value = destSheet;
+  renderActiveSheet(destSheet);
+  hideMoveModal();
+  hideModal();
+  showToast(`[${destSheet}] ${destRow}행-${destCol}열로 이동했습니다.`, "success");
+}
+
+function showWorkbookControls() {
+  if (rackFilterGroup) rackFilterGroup.style.display = "flex";
+  if (undoBtn && lastUndoSnapshot) undoBtn.style.display = "inline-block";
+}
 
 /** 엑셀 업로드 시 Supabase 자동 동기화 여부 (기본값: 켜짐) */
 function isAutoSyncOnUploadEnabled() {
@@ -544,12 +812,21 @@ async function loadBundledWorkbookBytes() {
 /** Supabase에서 최신 데이터를 다시 불러옴 (모바일 새로고침용) */
 async function reloadFromCloud() {
   if (!isOnline || !supabaseClient) {
-    alert("Supabase 연동 후 사용할 수 있습니다. ⚙️ DB 설정을 확인해 주세요.");
+    showToast("Supabase 연동 후 사용할 수 있습니다. ⚙️ DB 설정을 확인해 주세요.", "warning");
     return;
   }
   isUserLocalWorkbook = false;
   isDbImportInProgress = false;
-  await loadDataFromSupabase();
+  clearSyncFailed();
+  setGlobalLoading(true, "🟡 클라우드 동기화 중...");
+  try {
+    await loadDataFromSupabase();
+    showToast("클라우드 데이터를 불러왔습니다.", "success");
+  } catch (e) {
+    markSyncFailed("🔴 동기화 실패 — 클릭하여 재시도");
+  } finally {
+    setGlobalLoading(false);
+  }
 }
 
 function rememberLastSheet(sheetName) {
@@ -635,9 +912,9 @@ sheetSelect.addEventListener("change", (e) => {
   rememberLastSheet(e.target.value);
   renderActiveSheet(e.target.value);
 });
-searchInput.addEventListener("input", handleSearch);
-// 검색창 포커스 시 매칭 목록 재노출 처리
-searchInput.addEventListener("focus", handleSearch);
+searchInput.addEventListener("input", handleSearchInput);
+searchInput.addEventListener("focus", handleSearchInput);
+searchInput.addEventListener("keydown", handleSearchKeydown);
 exportBtn.addEventListener("click", exportUpdatedExcel);
 
 // 모달 닫기 이벤트들
@@ -671,10 +948,67 @@ if (cloudSyncBtn) {
   cloudSyncBtn.addEventListener("click", reloadFromCloud);
 }
 
-// 검색창 외부 영역 클릭 시 검색 결과 래퍼 닫기
+if (syncStatusEl) {
+  syncStatusEl.addEventListener("click", () => {
+    if (syncFailedState) reloadFromCloud();
+  });
+}
+
+if (rackFilterGroup) {
+  rackFilterGroup.querySelectorAll(".rack-filter-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      rackFilterGroup.querySelectorAll(".rack-filter-btn").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      rackDisplayFilter = btn.dataset.filter || "all";
+      if (currentSheetName) renderActiveSheet(currentSheetName);
+    });
+  });
+}
+
+if (undoBtn) undoBtn.addEventListener("click", performUndo);
+
+if (searchPrevBtn) {
+  searchPrevBtn.addEventListener("click", () => focusSearchMatchAt(lastSearchMatchIndex - 1));
+}
+if (searchNextBtn) {
+  searchNextBtn.addEventListener("click", () => focusSearchMatchAt(lastSearchMatchIndex + 1));
+}
+
+if (moveBtn) moveBtn.addEventListener("click", showMoveModal);
+if (closeMoveModal) closeMoveModal.addEventListener("click", hideMoveModal);
+if (cancelMoveBtn) cancelMoveBtn.addEventListener("click", hideMoveModal);
+if (confirmMoveBtn) confirmMoveBtn.addEventListener("click", confirmMoveStock);
+window.addEventListener("click", (e) => {
+  if (e.target === moveModal) hideMoveModal();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (moveModal?.classList.contains("show")) hideMoveModal();
+    else if (dbConfigModal?.classList.contains("show")) hideDbModal();
+    else if (editModal?.classList.contains("show")) hideModal();
+    else hideSearchAutocomplete();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+    if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
+    e.preventDefault();
+    performUndo();
+  }
+  if (e.key === "F3") {
+    e.preventDefault();
+    if (e.shiftKey) focusSearchMatchAt(lastSearchMatchIndex - 1);
+    else focusSearchMatchAt(lastSearchMatchIndex + 1);
+  }
+});
+
+// 검색창 외부 영역 클릭 시 검색 결과·자동완성 닫기
 document.addEventListener("click", (e) => {
-  if (!searchInput.contains(e.target) && !searchResultsWrap.contains(e.target)) {
+  const searchArea = searchInput?.closest(".search-wrapper");
+  if (searchArea && !searchArea.contains(e.target) && !searchResultsWrap.contains(e.target)) {
     searchResultsWrap.style.display = "none";
+  }
+  if (searchArea && !searchArea.contains(e.target)) {
+    hideSearchAutocomplete();
   }
 });
 
@@ -687,7 +1021,7 @@ document.body.addEventListener("drop", (e) => {
   const file = e.dataTransfer?.files?.[0];
   if (!file) return;
   if (!/\.xlsx?$/.test(file.name)) {
-    alert("엑셀 파일(.xlsx, .xls)만 업로드할 수 있습니다.");
+    showToast("엑셀 파일(.xlsx, .xls)만 업로드할 수 있습니다.", "warning");
     return;
   }
   loadWorkbookFromFile(file);
@@ -837,15 +1171,23 @@ function cellThemeHint(sheet, rowIdx, colIdx) {
  * File/Blob 객체에서 워크북을 읽어 UI에 반영
  */
 function loadWorkbookFromFile(file) {
+  setGlobalLoading(true, "🟡 엑셀 파일 읽는 중...");
   const reader = new FileReader();
+  reader.onerror = () => {
+    setGlobalLoading(false);
+    showToast("파일을 읽는 중 오류가 발생했습니다.", "error");
+  };
   reader.onload = function (e) {
     const data = new Uint8Array(e.target.result);
     try {
       const workbook = XLSX.read(data, { type: "array", cellStyles: true });
       applyLoadedWorkbook(workbook, undefined, true);
+      showToast("엑셀 파일을 불러왔습니다.", "success");
     } catch (err) {
       alert("엑셀 파일을 파싱하는 데 실패했습니다. 파일이 손상되었거나 유효한 엑셀 형식이 아닙니다.");
       console.error(err);
+    } finally {
+      setGlobalLoading(false);
     }
   };
   reader.readAsArrayBuffer(file);
@@ -864,6 +1206,7 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   }
 
   currentWorkbook = workbook;
+  rebuildProductCatalog();
 
   const warehouseSheets = getWarehouseSheetNames(workbook);
   if (warehouseSheets.length === 0) {
@@ -876,6 +1219,7 @@ function applyLoadedWorkbook(workbook, preferredSheetName, fromUserUpload = fals
   emptyGuide.style.display = "none";
   gridBoard.style.display = "grid";
   exportBtn.style.display = "inline-block";
+  showWorkbookControls();
 
   const defaultSheet = resolveDefaultSheetName(
     workbook,
@@ -915,25 +1259,12 @@ function handleFileSelect(e) {
  */
 function loadDemoWorkbook() {
   const wb = XLSX.utils.book_new();
-
-  // B2 시트 생성 함수 호출
   const sheetB2 = createMockSheet("B2");
   XLSX.utils.book_append_sheet(wb, sheetB2, "B2");
-
-  // B1 시트도 유사하게 임시 생성하여 추가 (다중 시트 전환 테스트 지원)
   const sheetB1 = createMockSheet("B1");
   XLSX.utils.book_append_sheet(wb, sheetB1, "B1");
-
-  currentWorkbook = wb;
-
-  updateSheetDropdown(getWarehouseSheetNames(wb));
-  emptyGuide.style.display = "none";
-  gridBoard.style.display = "grid";
-  exportBtn.style.display = "inline-block";
-
-  const defaultSheet = resolveDefaultSheetName(wb);
-  sheetSelect.value = defaultSheet;
-  renderActiveSheet(defaultSheet);
+  applyLoadedWorkbook(wb, resolveDefaultSheetName(wb), false);
+  showToast("데모 데이터를 불러왔습니다.", "info");
 }
 
 /**
@@ -1272,6 +1603,7 @@ function renderActiveSheet(sheetName) {
   // 그리드 보드 및 검색 필터 초기화
   gridBoard.innerHTML = "";
   searchInput.value = "";
+  hideSearchAutocomplete();
 
   // 동적으로 랙의 좌측/우측 배치 구조와 순서 배열 파악
   const { leftRacks, rightRacks } = detectRacks(sheet);
@@ -1302,6 +1634,9 @@ function renderActiveSheet(sheetName) {
   let totalProducts = 0;
   let totalPallets = 0;
   let totalBoxes = 0;
+  let stockedRacks = 0;
+  const totalRacks = totalCols * maxRows;
+  const duplicateMap = buildDuplicateProductMap();
 
   // 1행부터 maxRows행까지 루프 돌며 물리적 랙 셀들을 순서대로 배치
   for (let r = 1; r <= maxRows; r++) {
@@ -1320,14 +1655,16 @@ function renderActiveSheet(sheetName) {
       const colSeq = idx + 1; // 1-based 물리적 순번
       const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
       const zoneClass = resolveZoneClass(sheet, prodRowIdx, rackInfo.colIdx);
-      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass);
+      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass, duplicateMap);
       gridBoard.appendChild(cellEl);
+      applyRackFilterToCell(cellEl, cellData);
 
       if (cellData.product) {
         totalProducts++;
         totalPallets += cellData.pallet;
         totalBoxes += cellData.box;
       }
+      if (cellData.product || cellData.pallet > 0 || cellData.box > 0) stockedRacks++;
     });
 
     // 중앙 통로 셀 생성 (위치: leftCols + 2번째 컬럼)
@@ -1356,14 +1693,16 @@ function renderActiveSheet(sheetName) {
       const colSeq = leftCols + idx + 1; // 1-based 물리적 순번
       const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
       const zoneClass = resolveZoneClass(sheet, prodRowIdx, rackInfo.colIdx);
-      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass);
+      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass, duplicateMap);
       gridBoard.appendChild(cellEl);
+      applyRackFilterToCell(cellEl, cellData);
 
       if (cellData.product) {
         totalProducts++;
         totalPallets += cellData.pallet;
         totalBoxes += cellData.box;
       }
+      if (cellData.product || cellData.pallet > 0 || cellData.box > 0) stockedRacks++;
     });
 
     // 오른쪽 행 번호 라벨 생성
@@ -1380,6 +1719,10 @@ function renderActiveSheet(sheetName) {
   totalProductsEl.textContent = totalProducts;
   totalPalletsEl.textContent = totalPallets;
   totalBoxesEl.textContent = totalBoxes;
+  if (occupancyRateEl) {
+    const pct = totalRacks > 0 ? Math.round((stockedRacks / totalRacks) * 100) : 0;
+    occupancyRateEl.textContent = `${stockedRacks}/${totalRacks} (${pct}%)`;
+  }
 
   if (mobileScrollHint) {
     mobileScrollHint.style.display = isMobileViewport() ? "block" : "none";
@@ -1456,13 +1799,17 @@ function getRackCellData(sheet, colMapping, row, col, prodRowIdx, qtyRowIdx) {
 /**
  * 랙 셀 DOM 엘리먼트 생성
  */
-function createRackCellElement(row, col, cellData, rackNo, zoneClass = "") {
+function createRackCellElement(row, col, cellData, rackNo, zoneClass = "", duplicateMap = null) {
   const cell = document.createElement("div");
   const classes = ["rack-cell"];
-  if (cellData.product || cellData.pallet > 0 || cellData.box > 0) {
+  const hasStock = cellData.product || cellData.pallet > 0 || cellData.box > 0;
+  if (hasStock) {
     classes.push("active-stock");
   }
   if (zoneClass) classes.push(zoneClass);
+  if (duplicateMap && cellData.product && (duplicateMap.get(cellData.product.toLowerCase()) || 0) > 1) {
+    classes.push("has-duplicate");
+  }
   cell.className = classes.join(" ");
 
   // 검색 시 필터링을 쉽게 하기 위해 제품명을 data 속성으로 주입
@@ -1579,6 +1926,177 @@ function matchesProductSearch(productName, query) {
   return String(productName ?? "").trim().toLowerCase() === query.trim().toLowerCase();
 }
 
+function rebuildProductCatalog() {
+  const names = new Set();
+  if (!currentWorkbook) {
+    productCatalogCache = [];
+    return;
+  }
+
+  const warehouseSheets = getWarehouseSheetNames(currentWorkbook);
+  warehouseSheets.forEach((sheetName) => {
+    const sheet = currentWorkbook.Sheets[sheetName];
+    if (!sheet) return;
+
+    const maxCols = detectMaxCols(sheet);
+    const maxRows = detectMaxRows(sheet);
+    const colMapping = detectColumnMapping(sheet, maxCols);
+
+    for (let r = 1; r <= maxRows; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      for (let c = 1; c <= maxCols; c++) {
+        const pColIdx = colMapping[c];
+        if (pColIdx === undefined) continue;
+
+        const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pColIdx });
+        const cellObj = sheet[prodAddr];
+        if (cellObj && cellObj.v !== undefined) {
+          const name = String(cellObj.v).trim();
+          if (name) names.add(name);
+        }
+      }
+    }
+  });
+
+  productCatalogCache = [...names].sort((a, b) => a.localeCompare(b, "ko"));
+}
+
+function getProductSuggestions(query, limit = 10) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+
+  const matched = productCatalogCache.filter((name) => includesProductSearch(name, q));
+  matched.sort((a, b) => {
+    const aLower = a.toLowerCase();
+    const bLower = b.toLowerCase();
+    const rank = (value) => {
+      if (value === q) return 0;
+      if (value.startsWith(q)) return 1;
+      return 2;
+    };
+    const diff = rank(aLower) - rank(bLower);
+    return diff !== 0 ? diff : a.localeCompare(b, "ko");
+  });
+
+  return matched.slice(0, limit);
+}
+
+function appendAutocompleteHighlight(parent, name, query) {
+  const lowerName = name.toLowerCase();
+  const lowerQuery = query.trim().toLowerCase();
+  const matchIndex = lowerName.indexOf(lowerQuery);
+
+  if (matchIndex < 0) {
+    parent.textContent = name;
+    return;
+  }
+
+  if (matchIndex > 0) {
+    parent.appendChild(document.createTextNode(name.slice(0, matchIndex)));
+  }
+
+  const mark = document.createElement("mark");
+  mark.textContent = name.slice(matchIndex, matchIndex + lowerQuery.length);
+  parent.appendChild(mark);
+
+  const rest = name.slice(matchIndex + lowerQuery.length);
+  if (rest) {
+    parent.appendChild(document.createTextNode(rest));
+  }
+}
+
+function hideSearchAutocomplete() {
+  if (!searchAutocomplete) return;
+  searchAutocomplete.style.display = "none";
+  searchAutocomplete.innerHTML = "";
+  autocompleteActiveIndex = -1;
+  searchInput?.setAttribute("aria-expanded", "false");
+}
+
+function selectAutocompleteSuggestion(value) {
+  searchInput.value = value;
+  hideSearchAutocomplete();
+  handleSearch();
+  searchInput.focus();
+}
+
+function updateSearchAutocomplete() {
+  if (!searchAutocomplete) return;
+
+  const query = searchInput.value.trim();
+  if (!query || !currentWorkbook) {
+    hideSearchAutocomplete();
+    return;
+  }
+
+  const suggestions = getProductSuggestions(query);
+  searchAutocomplete.innerHTML = "";
+  if (suggestions.length === 0) {
+    hideSearchAutocomplete();
+    return;
+  }
+
+  suggestions.forEach((name, index) => {
+    const item = document.createElement("li");
+    item.className = "search-autocomplete-item";
+    item.role = "option";
+    item.dataset.value = name;
+    if (index === autocompleteActiveIndex) {
+      item.classList.add("active");
+    }
+    appendAutocompleteHighlight(item, name, query);
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      selectAutocompleteSuggestion(name);
+    });
+    searchAutocomplete.appendChild(item);
+  });
+
+  searchAutocomplete.style.display = "block";
+  searchInput.setAttribute("aria-expanded", "true");
+}
+
+function handleSearchInput() {
+  autocompleteActiveIndex = -1;
+  updateSearchAutocomplete();
+  handleSearch();
+}
+
+function handleSearchKeydown(e) {
+  const items = searchAutocomplete?.querySelectorAll(".search-autocomplete-item") || [];
+  const autocompleteVisible = searchAutocomplete && searchAutocomplete.style.display !== "none" && items.length > 0;
+
+  if (autocompleteVisible) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      autocompleteActiveIndex = (autocompleteActiveIndex + 1) % items.length;
+      items.forEach((el, i) => el.classList.toggle("active", i === autocompleteActiveIndex));
+      items[autocompleteActiveIndex]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      autocompleteActiveIndex = autocompleteActiveIndex <= 0 ? items.length - 1 : autocompleteActiveIndex - 1;
+      items.forEach((el, i) => el.classList.toggle("active", i === autocompleteActiveIndex));
+      items[autocompleteActiveIndex]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter" && autocompleteActiveIndex >= 0) {
+      e.preventDefault();
+      selectAutocompleteSuggestion(items[autocompleteActiveIndex].dataset.value);
+    } else if (e.key === "Escape") {
+      hideSearchAutocomplete();
+    }
+    return;
+  }
+
+  if (e.key === "Enter" && searchInput.value.trim()) {
+    e.preventDefault();
+    handleSearch();
+    if (lastSearchMatches.length > 0) {
+      focusSearchMatchAt(0);
+    }
+  } else if (e.key === "Escape") {
+    hideSearchAutocomplete();
+  }
+}
+
 /**
  * 4. 재고 검색 및 위치 네비게이션 기능 (전 구역 통합 검색 지원)
  */
@@ -1602,6 +2120,9 @@ function handleSearch(e) {
   if (!currentWorkbook || query === "") {
     searchResultsWrap.style.display = "none";
     searchResults.innerHTML = "";
+    lastSearchMatches = [];
+    lastSearchMatchIndex = -1;
+    updateSearchNavBar();
     return;
   }
 
@@ -1661,6 +2182,9 @@ function handleSearch(e) {
 
   // 4. 실시간 검색 결과 패널 동적 렌더링
   searchResults.innerHTML = "";
+  lastSearchMatches = matches;
+  lastSearchMatchIndex = matches.length > 0 ? 0 : -1;
+  updateSearchNavBar();
 
   if (matches.length > 0) {
     searchResultsWrap.style.display = "block"; // 래퍼를 보여준다 = 창고 도면이 자연스럽게 아래로 밀림
@@ -1690,11 +2214,11 @@ function handleSearch(e) {
     // 4.3. 개별 매칭 결과 카드를 목록 창에 삽입
     matches.forEach((match) => {
       const item = document.createElement("div");
-      item.className = "search-result-item";
-      // 리스트에 구역 정보와 함께 우측에 수량 배지(P, B)를 표시
+      item.className = "search-result-item" + (match.exactMatch ? " exact-match-item" : " partial-match");
+      const relatedBadge = match.exactMatch ? "" : `<span class="match-related-badge">연관</span>`;
       item.innerHTML = `
         <div style="display: flex; flex-direction: column; gap: 0.2rem;">
-          <span class="match-name">${match.product}</span>
+          <span class="match-name">${match.product}${relatedBadge}</span>
           <span class="match-coord">[${match.sheetName} 구역] ${match.row}행 - ${match.col}열</span>
         </div>
         <div class="match-qty-badge">
@@ -1703,8 +2227,9 @@ function handleSearch(e) {
         </div>
       `;
       
-      // 검색 결과 클릭 시 ➔ 구역(시트) 전환 + 렌더링 + 화면 스크롤 포커스 이동
       item.addEventListener("click", () => {
+        lastSearchMatchIndex = matches.indexOf(match);
+        updateSearchNavBar();
         // 클릭한 항목의 구역이 현재 활성화된 구역과 다르면 시트 강제 교체 및 화면 재구축
         if (currentSheetName !== match.sheetName) {
           sheetSelect.value = match.sheetName;
@@ -1737,6 +2262,9 @@ function handleSearch(e) {
     });
   } else {
     searchResultsWrap.style.display = "none";
+    lastSearchMatches = [];
+    lastSearchMatchIndex = -1;
+    updateSearchNavBar();
   }
 }
 
@@ -1761,6 +2289,9 @@ function showEditModal(row, col, cellData, rackNo) {
     deleteBtn.disabled = !hasData;
     deleteBtn.style.display = hasData ? "" : "none";
   }
+  if (moveBtn) {
+    moveBtn.style.display = hasData ? "" : "none";
+  }
 
   editModal.classList.add("show");
   document.body.classList.add("modal-open");
@@ -1782,8 +2313,12 @@ function hideModal() {
 /**
  * 사용자가 수정한 재고를 엑셀 데이터 구조에 반영하고 화면을 새로고침합니다.
  */
-async function applyCellChanges(newProduct, newPallet, newBox) {
+async function applyCellChanges(newProduct, newPallet, newBox, options = {}) {
   if (!selectedCellInfo || !currentSheetData) return;
+
+  if (!options.skipUndo) {
+    saveUndoSnapshot();
+  }
 
   const sheet = currentSheetData;
   const cellInfo = selectedCellInfo.data;
@@ -1819,14 +2354,18 @@ async function applyCellChanges(newProduct, newPallet, newBox) {
         if (error) throw error;
       }
     } catch (e) {
-      alert("서버 데이터 동기화에 실패했습니다. (오프라인 변경만 적용됨)");
+      showToast("서버 동기화 실패 — 로컬 변경만 저장됨", "warning");
       console.error(e);
     }
   }
 
   aggregateTotalSheet(currentWorkbook);
+  rebuildProductCatalog();
   renderActiveSheet(currentSheetName);
   hideModal();
+  if (!options.skipUndo) {
+    showToast("재고를 저장했습니다.", "success");
+  }
 }
 
 async function saveCellChanges() {
@@ -1880,34 +2419,29 @@ function updateExcelCellValue(sheet, address, val, type) {
 function exportUpdatedExcel() {
   if (!currentWorkbook) return;
 
+  setGlobalLoading(true, "🟡 엑셀 생성 중...");
   try {
-    // 다운로드 직전 TOTAL 시트에 전체 구역 파렛트(P)/박스(B) 합산 집계
     aggregateTotalSheet(currentWorkbook);
-
-    // 엑셀 저장 직전에 가독성 디자인(색상, 테두리, 너비 등) 적용
     applyExcelStyles(currentWorkbook);
-
-    // 워크북을 바이너리 배열 형태로 저장 (xlsx-js-style 지원을 위해 cellStyles 활성화)
     const wbout = XLSX.write(currentWorkbook, { bookType: "xlsx", type: "array", cellStyles: true });
     const blob = new Blob([wbout], { type: "application/octet-stream" });
-    
-    // 다운로드 링크 동적 생성
+    const filename = `재고조사표_수정본_${new Date().toISOString().slice(0, 10)}.xlsx`;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    // 기존 파일명에 '_수정본'을 붙이거나 기본 명칭 사용
-    a.download = `재고조사표_수정본_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
-    
-    // 리소스 해제
     setTimeout(() => {
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
     }, 0);
+    showToast(`다운로드: ${filename}`, "success", 4000);
   } catch (err) {
     alert("엑셀 파일을 생성하고 다운로드하는 도중 오류가 발생했습니다.");
     console.error(err);
+  } finally {
+    setGlobalLoading(false);
   }
 }
 
@@ -2101,8 +2635,49 @@ function aggregateTotalSheet(workbook) {
 
 
 /**
- * xlsx-js-style 라이브러리를 활용하여 다운로드 엑셀 파일에 격자 및 색상 서식을 입힙니다.
+ * 창고 시트 통로(좌·우 랙 사이) 열 인덱스 집합
  */
+function getAisleColumnSet(sheet) {
+  const aisleCols = new Set();
+  const { leftRacks, rightRacks } = detectRacks(sheet);
+  if (!leftRacks.length || !rightRacks.length) return aisleCols;
+
+  const leftEnd = leftRacks[leftRacks.length - 1].colIdx + 1;
+  const rightStart = rightRacks[0].colIdx;
+  for (let colIdx = leftEnd + 1; colIdx < rightStart; colIdx++) {
+    aisleCols.add(colIdx);
+  }
+  return aisleCols;
+}
+
+/**
+ * 제품명 길이에 맞춰 랙(P) 열 너비 계산
+ */
+function computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows) {
+  const widths = {};
+  widths[0] = { wch: 5 };
+
+  for (let c = 1; c <= maxCols; c++) {
+    const pCol = colMapping[c];
+    if (pCol === undefined) continue;
+
+    let maxLen = 6;
+    for (let r = 1; r <= maxRows; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      const prodAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: pCol });
+      const cell = sheet[prodAddr];
+      if (cell?.v !== undefined) {
+        maxLen = Math.max(maxLen, String(cell.v).trim().length);
+      }
+    }
+
+    widths[pCol] = { wch: Math.min(22, Math.max(11, maxLen + 1)) };
+    widths[pCol + 1] = { wch: 7 };
+  }
+
+  return widths;
+}
+
 /**
  * xlsx-js-style 라이브러리를 활용하여 다운로드 엑셀 파일에 격자 및 색상 서식을 입힙니다.
  */
@@ -2111,7 +2686,6 @@ function applyExcelStyles(workbook) {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet) continue;
 
-    // TOTAL 시트는 전용 함수로 처리
     if (sheetName.toUpperCase() === "TOTAL" || sheetName.includes("합계")) {
       applyTotalSheetStyles(sheet);
       continue;
@@ -2120,115 +2694,118 @@ function applyExcelStyles(workbook) {
     const maxCols = detectMaxCols(sheet);
     const maxRows = detectMaxRows(sheet);
     const colMapping = detectColumnMapping(sheet, maxCols);
+    const aisleCols = getAisleColumnSet(sheet);
 
     const lastColIdx = colMapping[maxCols] || (2 * maxCols + 1);
-    const rightLabelCol = lastColIdx + 1; // 랙들의 우측 끝 바로 다음 열을 행 번호 라벨용으로 지정
+    const rightLabelCol = lastColIdx + 1;
 
-    // 1. 열 너비 지정 (각 시트의 폭을 최적화)
-    const colsWidths = [];
-    colsWidths[0] = { wch: 6 }; // 좌측 행 번호 라벨 열 너비
-    
-    // colMapping에 따라 각 랙 열 너비 할당 (P: 14, B: 6)
-    for (let c = 1; c <= maxCols; c++) {
-      const pCol = colMapping[c];
-      if (pCol !== undefined) {
-        colsWidths[pCol] = { wch: 14 }; // 제품명 및 파렛트(P) 열
-        colsWidths[pCol + 1] = { wch: 6 };  // 박스(B) 열
-      }
-    }
-    
-    // 통로 및 기타 미지정 열 너비 기본값 채우기
+    const colWidths = computeWarehouseColumnWidths(sheet, colMapping, maxCols, maxRows);
     for (let i = 0; i <= rightLabelCol; i++) {
-      if (!colsWidths[i]) {
-        colsWidths[i] = { wch: 4 }; // 콤팩트 통로
+      if (!colWidths[i]) {
+        colWidths[i] = aisleCols.has(i) ? { wch: 3 } : { wch: 4 };
       }
     }
-    colsWidths[rightLabelCol] = { wch: 6 }; // 우측 행 번호 라벨 열 너비
-    sheet["!cols"] = colsWidths;
+    colWidths[rightLabelCol] = { wch: 5 };
+    sheet["!cols"] = colWidths;
 
-    // 2. 셀 스타일 정의
-    // 얇은 실선 테두리 스타일
-    const borderGray = {
-      top: { style: "thin", color: { rgb: "D1D5DB" } },
-      bottom: { style: "thin", color: { rgb: "D1D5DB" } },
-      left: { style: "thin", color: { rgb: "D1D5DB" } },
-      right: { style: "thin", color: { rgb: "D1D5DB" } }
-    };
-    
-    const borderMint = {
-      top: { style: "thin", color: { rgb: "A5D6A7" } },
-      bottom: { style: "thin", color: { rgb: "A5D6A7" } },
-      left: { style: "thin", color: { rgb: "A5D6A7" } },
-      right: { style: "thin", color: { rgb: "A5D6A7" } }
-    };
+    if (!sheet["!rows"]) sheet["!rows"] = [];
+    sheet["!rows"][2] = { hpt: 24 };
+    sheet["!rows"][3] = { hpt: 20 };
+    sheet["!rows"][4] = { hpt: 18 };
+    sheet["!rows"][5] = { hpt: 18 };
 
-    const borderBlue = {
-      top: { style: "thin", color: { rgb: "90CAF9" } },
-      bottom: { style: "thin", color: { rgb: "90CAF9" } },
-      left: { style: "thin", color: { rgb: "90CAF9" } },
-      right: { style: "thin", color: { rgb: "90CAF9" } }
-    };
-
-    const borderPink = {
-      top: { style: "thin", color: { rgb: "FFCDD2" } },
-      bottom: { style: "thin", color: { rgb: "FFCDD2" } },
-      left: { style: "thin", color: { rgb: "FFCDD2" } },
-      right: { style: "thin", color: { rgb: "FFCDD2" } }
-    };
+    sheet["!views"] = [{
+      state: "frozen",
+      xSplit: 1,
+      ySplit: 6,
+      topLeftCell: "B7",
+      activeCell: "B7",
+    }];
 
     const fontName = "맑은 고딕";
+    const borderGray = {
+      top: { style: "thin", color: { rgb: "CBD5E1" } },
+      bottom: { style: "thin", color: { rgb: "CBD5E1" } },
+      left: { style: "thin", color: { rgb: "CBD5E1" } },
+      right: { style: "thin", color: { rgb: "CBD5E1" } },
+    };
+    const borderRack = {
+      top: { style: "thin", color: { rgb: "94A3B8" } },
+      bottom: { style: "thin", color: { rgb: "94A3B8" } },
+      left: { style: "thin", color: { rgb: "94A3B8" } },
+      right: { style: "medium", color: { rgb: "64748B" } },
+    };
 
-    // 스타일 프리셋 (xlsx-js-style 배경색 채우기를 위해 patternType: "solid" 적용)
+    const sTitle = {
+      font: { name: fontName, sz: 12, bold: true, color: { rgb: "0F172A" } },
+      fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
+      alignment: { vertical: "center", horizontal: "center" },
+      border: borderGray,
+    };
     const sHeader = {
-      font: { name: fontName, size: 9, bold: true, color: { rgb: "1F2937" } },
-      fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } }, // 옅은 회색 배경
+      font: { name: fontName, sz: 10, bold: true, color: { rgb: "1E293B" } },
+      fill: { patternType: "solid", fgColor: { rgb: "E2E8F0" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderGray
+      border: borderGray,
     };
-
     const sProduct = {
-      font: { name: fontName, size: 9, bold: true, color: { rgb: "1E293B" } },
-      fill: { patternType: "solid", fgColor: { rgb: "E8F5E9" } }, // 민트 파스텔 연초록
-      alignment: { vertical: "center", horizontal: "center" },
-      border: borderMint
+      font: { name: fontName, sz: 10, bold: true, color: { rgb: "14532D" } },
+      fill: { patternType: "solid", fgColor: { rgb: "DCFCE7" } },
+      alignment: { vertical: "center", horizontal: "center", wrapText: true },
+      border: borderGray,
     };
-
     const sPallet = {
-      font: { name: fontName, size: 9, bold: true, color: { rgb: "1D4ED8" } }, // 파란 수량 글씨
-      fill: { patternType: "solid", fgColor: { rgb: "E3F2FD" } }, // 연하늘색 배경
+      font: { name: fontName, sz: 10, bold: true, color: { rgb: "1D4ED8" } },
+      fill: { patternType: "solid", fgColor: { rgb: "DBEAFE" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderBlue
+      border: borderGray,
     };
-
     const sBox = {
-      font: { name: fontName, size: 9, bold: true, color: { rgb: "BE123C" } }, // 붉은 수량 글씨
-      fill: { patternType: "solid", fgColor: { rgb: "FFEBEE" } }, // 연분홍색 배경
+      font: { name: fontName, sz: 10, bold: true, color: { rgb: "BE123C" } },
+      fill: { patternType: "solid", fgColor: { rgb: "FFE4E6" } },
       alignment: { vertical: "center", horizontal: "center" },
-      border: borderPink
+      border: borderRack,
     };
-
     const sEmptyGrid = {
-      fill: { patternType: "solid", fgColor: { rgb: "FFFFFF" } }, // 흰색 배경으로 격자 테두리 유지
-      border: borderGray
+      font: { name: fontName, sz: 9, color: { rgb: "CBD5E1" } },
+      fill: { patternType: "solid", fgColor: { rgb: "F8FAFC" } },
+      border: borderGray,
+    };
+    const sAisle = {
+      fill: { patternType: "solid", fgColor: { rgb: "E5E7EB" } },
+      border: {
+        top: { style: "thin", color: { rgb: "D1D5DB" } },
+        bottom: { style: "thin", color: { rgb: "D1D5DB" } },
+        left: { style: "thin", color: { rgb: "D1D5DB" } },
+        right: { style: "thin", color: { rgb: "D1D5DB" } },
+      },
     };
 
-    // 1행부터 maxRows행까지 순회하며 격자 셀 스타일링
+    for (let colIdx of aisleCols) {
+      for (let rowIdx = 2; rowIdx <= 5 + maxRows * 2; rowIdx++) {
+        const addr = XLSX.utils.encode_cell({ r: rowIdx, c: colIdx });
+        if (!sheet[addr]) sheet[addr] = { t: "s", v: "" };
+        sheet[addr].s = sAisle;
+      }
+    }
+
     for (let r = 1; r <= maxRows; r++) {
       const prodRowIdx = 7 + 2 * (r - 1);
       const qtyRowIdx = 8 + 2 * (r - 1);
+      if (!sheet["!rows"][prodRowIdx]) sheet["!rows"][prodRowIdx] = { hpt: 24 };
+      if (!sheet["!rows"][qtyRowIdx]) sheet["!rows"][qtyRowIdx] = { hpt: 18 };
 
-      // 행 라벨 (좌/우) 스타일링
-      const leftLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 });
-      const leftQtyLabelAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: 0 });
-      const rightLabelAddr = XLSX.utils.encode_cell({ r: prodRowIdx, c: rightLabelCol });
-      const rightQtyLabelAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: rightLabelCol });
-
-      [leftLabelAddr, leftQtyLabelAddr, rightLabelAddr, rightQtyLabelAddr].forEach((addr) => {
+      const labelAddrs = [
+        XLSX.utils.encode_cell({ r: prodRowIdx, c: 0 }),
+        XLSX.utils.encode_cell({ r: qtyRowIdx, c: 0 }),
+        XLSX.utils.encode_cell({ r: prodRowIdx, c: rightLabelCol }),
+        XLSX.utils.encode_cell({ r: qtyRowIdx, c: rightLabelCol }),
+      ];
+      labelAddrs.forEach((addr) => {
         if (!sheet[addr]) sheet[addr] = { t: "n", v: r };
         sheet[addr].s = sHeader;
       });
 
-      // 1~maxCols열 격자 루프
       for (let c = 1; c <= maxCols; c++) {
         const pCol = colMapping[c];
         if (pCol === undefined) continue;
@@ -2238,17 +2815,27 @@ function applyExcelStyles(workbook) {
         const palletAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: pCol });
         const boxAddr = XLSX.utils.encode_cell({ r: qtyRowIdx, c: bCol });
 
-        // 데이터가 없는 셀도 얇은 선명 격자를 만들기 위해 셀 구조 선언
         if (!sheet[prodAddr]) sheet[prodAddr] = { t: "s", v: "" };
         if (!sheet[palletAddr]) sheet[palletAddr] = { t: "s", v: "" };
         if (!sheet[boxAddr]) sheet[boxAddr] = { t: "s", v: "" };
 
         const productVal = String(sheet[prodAddr].v || "").trim();
+        const palletVal = sheet[palletAddr].v;
+        const boxVal = sheet[boxAddr].v;
+        const hasStock = productVal !== "" || (Number(palletVal) || 0) > 0 || (Number(boxVal) || 0) > 0;
 
-        if (productVal !== "") {
+        if (hasStock) {
           sheet[prodAddr].s = sProduct;
           sheet[palletAddr].s = sPallet;
           sheet[boxAddr].s = sBox;
+          if (sheet[palletAddr].v !== undefined && sheet[palletAddr].v !== "") {
+            sheet[palletAddr].t = "n";
+            sheet[palletAddr].v = Number(sheet[palletAddr].v) || 0;
+          }
+          if (sheet[boxAddr].v !== undefined && sheet[boxAddr].v !== "") {
+            sheet[boxAddr].t = "n";
+            sheet[boxAddr].v = Number(sheet[boxAddr].v) || 0;
+          }
         } else {
           sheet[prodAddr].s = sEmptyGrid;
           sheet[palletAddr].s = sEmptyGrid;
@@ -2257,24 +2844,23 @@ function applyExcelStyles(workbook) {
       }
     }
 
-    // 상단 축 헤더 라벨링 스타일 입히기
+    const titleAddr = XLSX.utils.encode_cell({ r: 2, c: 2 });
+    if (sheet[titleAddr]) sheet[titleAddr].s = sTitle;
+
     for (let c = 1; c <= maxCols; c++) {
       const pCol = colMapping[c];
       if (pCol === undefined) continue;
       const bCol = pCol + 1;
 
-      // 4행 열 번호
-      const colNumAddr = XLSX.utils.encode_cell({ r: 4, c: pCol });
+      const colNumAddr = XLSX.utils.encode_cell({ r: 3, c: pCol });
       if (sheet[colNumAddr]) sheet[colNumAddr].s = sHeader;
 
-      // 5행 "제품"
-      const prodLabelAddr = XLSX.utils.encode_cell({ r: 5, c: pCol });
+      const prodLabelAddr = XLSX.utils.encode_cell({ r: 4, c: pCol });
       if (sheet[prodLabelAddr]) sheet[prodLabelAddr].s = sHeader;
 
-      // 6행 P / B
-      const pAddr = XLSX.utils.encode_cell({ r: 6, c: pCol });
+      const pAddr = XLSX.utils.encode_cell({ r: 5, c: pCol });
       if (sheet[pAddr]) sheet[pAddr].s = sHeader;
-      const bAddr = XLSX.utils.encode_cell({ r: 6, c: bCol });
+      const bAddr = XLSX.utils.encode_cell({ r: 5, c: bCol });
       if (sheet[bAddr]) sheet[bAddr].s = sHeader;
     }
   }
@@ -2436,6 +3022,7 @@ function initSupabase() {
     try {
       supabaseClient = window.supabase.createClient(url, key);
       isOnline = true;
+      clearSyncFailed();
       syncStatusEl.textContent = "🟢 실시간 동기화 중";
       syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
       syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
@@ -2570,6 +3157,7 @@ async function loadDataFromSupabase() {
     emptyGuide.style.display = "none";
     gridBoard.style.display = "grid";
     exportBtn.style.display = "inline-block";
+    showWorkbookControls();
 
     const defaultSheet = resolveDefaultSheetName(
       currentWorkbook,
@@ -2577,6 +3165,7 @@ async function loadDataFromSupabase() {
       dbSheetNames
     );
     sheetSelect.value = defaultSheet;
+    rebuildProductCatalog();
     renderActiveSheet(defaultSheet);
     rememberLastSheet(defaultSheet);
 
@@ -2634,21 +3223,13 @@ async function loadDataFromSupabase() {
       dbSheetNames,
       wbSheetNames
     );
+    clearSyncFailed();
   } catch (err) {
     if (loadToken !== supabaseLoadToken) return;
     console.error("데이터베이스 로드 실패:", err);
-    syncStatusEl.textContent = `🔴 동기화 실패 — ${err.message || err}`;
-    syncStatusEl.style.background = "rgba(239, 68, 68, 0.1)";
-    syncStatusEl.style.border = "1px solid rgba(239, 68, 68, 0.4)";
-    syncStatusEl.style.color = "#ef4444";
+    markSyncFailed(`🔴 동기화 실패 — 클릭하여 재시도`);
     updateSyncDiagnostics(0, false, "bundled");
-    if (isMobileViewport()) {
-      alert(
-        "모바일 동기화 실패\n\n" +
-          (err.message || err) +
-          "\n\n① ⚙️ DB 설정 → PC와 동일한 URL·Key 입력\n② PC에서 엑셀 업로드\n③ 🔄 클라우드 동기화 버튼"
-      );
-    }
+    showToast(err.message || "데이터베이스 로드에 실패했습니다.", "error", 5000);
   }
 }
 
@@ -2725,6 +3306,7 @@ async function importWorkbookToSupabase() {
   isUserLocalWorkbook = true;
   supabaseLoadToken += 1;
   pauseRealtimeSync();
+  setGlobalLoading(true, "🟡 DB 동기화 중...");
 
   try {
     syncStatusEl.textContent = "🟡 DB 덮어쓰기 중...";
@@ -2831,6 +3413,8 @@ async function importWorkbookToSupabase() {
     syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
     syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
     syncStatusEl.style.color = "#10b981";
+    clearSyncFailed();
+    showToast("엑셀 데이터를 DB에 동기화했습니다.", "success");
 
     const workbookSaved = await persistUploadedWorkbook(currentWorkbook);
     if (!workbookSaved) {
@@ -2838,15 +3422,15 @@ async function importWorkbookToSupabase() {
       syncStatusEl.style.background = "rgba(245, 158, 11, 0.12)";
       syncStatusEl.style.border = "1px solid rgba(245, 158, 11, 0.4)";
       syncStatusEl.style.color = "#fbbf24";
-      alert(
-        "재고·도면 레이아웃은 DB에 저장됐습니다.\n엑셀 원본 파일 저장만 실패했 — 모바일은 DB 재고 도면으로 표시됩니다.\n\n더 정확한 도면을 위해 엑셀을 한 번 더 업로드해 주세요."
-      );
+      showToast("재고·도면은 DB에 저장됐으나 엑셀 원본 저장만 실패했습니다.", "warning", 5000);
     }
   } catch (err) {
-    alert("서버에 데이터를 업로드하는 중 오류가 발생했습니다.");
+    markSyncFailed("🔴 업로드 동기화 실패 — 클릭하여 재시도");
+    showToast("서버에 데이터를 업로드하는 중 오류가 발생했습니다.", "error");
     console.error(err);
     setOfflineMode();
   } finally {
+    setGlobalLoading(false);
     isDbImportInProgress = false;
     isUserLocalWorkbook = true;
     // 서버 템플릿 재로드는 막되, 셀 단위 실시간 변경은 PC·모바일 간 수신
@@ -2955,7 +3539,7 @@ function saveDbConfig() {
   const key = inputDbKey.value.trim();
   
   if (!url || !key) {
-    alert("URL과 Anon Key를 모두 입력해야 저장됩니다.");
+    showToast("URL과 Anon Key를 모두 입력해야 저장됩니다.", "warning");
     return;
   }
 
@@ -2985,7 +3569,7 @@ function saveDbConfig() {
     isDbImportInProgress = false;
     supabaseLoadToken += 1;
     initSupabase();
-    alert("연결 성공! 데이터를 불러옵니다.");
+    showToast("연결 성공! 데이터를 불러옵니다.", "success");
   });
 }
 
@@ -2994,7 +3578,7 @@ function disconnectDb() {
     localStorage.removeItem("supabase_url");
     localStorage.removeItem("supabase_anon_key");
     hideDbModal();
-    alert("연동 해제 완료.");
+    showToast("연동 해제 완료.", "info");
     window.location.reload();
   }
 }

@@ -11,7 +11,7 @@
   <meta name="description" content="엑셀 기반의 창고 재고 데이터를 시각적인 랙(Rack) 레이아웃으로 변환하고 직관적으로 수정을 돕는 웹 애플리케이션입니다.">
   
   <!-- 디자인 스타일시트 연결 -->
-  <link rel="stylesheet" href="styles.css?v=20260708h">
+  <link rel="stylesheet" href="styles.css?v=20260708l">
   
   <!-- 외부 엑셀 파싱 및 스타일 라이브러리 (xlsx-js-style) CDN 로드 -->
   <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
@@ -50,6 +50,16 @@
           </select>
         </div>
 
+        <!-- 랙 표시 필터 -->
+        <div class="rack-filter-group" id="rackFilterGroup" style="display: none;">
+          <label>표시:</label>
+          <button type="button" class="rack-filter-btn active" data-filter="all">전체</button>
+          <button type="button" class="rack-filter-btn" data-filter="stocked">재고 있음</button>
+          <button type="button" class="rack-filter-btn" data-filter="empty">빈 랙</button>
+        </div>
+
+        <button id="undoBtn" type="button" class="btn-secondary undo-btn" style="display: none;" title="Ctrl+Z">↩ 실행 취소</button>
+
         <!-- 실시간 재고 검색 기능 -->
         <div class="search-wrapper">
           <!-- 돋보기 아이콘 SVG -->
@@ -59,7 +69,8 @@
               <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
             </svg>
           </span>
-          <input type="text" id="searchInput" class="search-input" placeholder="제품명 검색 (예: PP300)..." autocomplete="off">
+          <input type="text" id="searchInput" class="search-input" placeholder="제품명 검색 (예: PP300)..." autocomplete="off" aria-autocomplete="list" aria-controls="searchAutocomplete" aria-expanded="false">
+          <ul id="searchAutocomplete" class="search-autocomplete" role="listbox" style="display: none;"></ul>
         </div>
 
         <!-- 수정본 엑셀 내보내기 버튼 (기본은 비활성화 상태) -->
@@ -69,6 +80,11 @@
 
     <!-- 검색 결과 드롭다운 영역: 헤더 바깥, 창고 도면 위에 독립 배치하여 겹침 완전 방지 -->
     <div id="searchResultsWrap" class="search-results-wrap" style="display: none;">
+      <div class="search-nav-bar" id="searchNavBar" style="display: none;">
+        <button type="button" id="searchPrevBtn">◀ 이전</button>
+        <span id="searchNavLabel" class="search-nav-label">0 / 0</span>
+        <button type="button" id="searchNextBtn">다음 ▶</button>
+      </div>
       <div id="searchResults" class="search-results-panel"></div>
     </div>
 
@@ -89,6 +105,10 @@
       <div class="summary-item">
         <span class="label">도면 규격:</span>
         <span id="layoutInfo" class="value">-</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">구역 점유율:</span>
+        <span id="occupancyRate" class="value">-</span>
       </div>
       <div class="summary-item sync-diagnostics-item" style="flex: 1 1 100%;">
         <span id="syncDiagnostics" class="label" style="color: var(--text-muted); font-size: 0.8rem;">DB 연결 상태 확인 중...</span>
@@ -185,6 +205,7 @@
 
       <!-- 모달 하단 버튼 버튼 영역 -->
       <div class="modal-actions">
+        <button id="moveBtn" type="button" class="btn-secondary" style="margin-right: auto;">다른 랙으로 이동</button>
         <button id="deleteBtn" type="button" class="btn-danger">삭제하기</button>
         <button id="cancelBtn" type="button" class="btn-secondary">취소</button>
         <button id="saveBtn" type="button" class="btn-primary">저장하기</button>
@@ -233,8 +254,42 @@
     </div>
   </div>
 
+  <!-- 재고 이동 모달 -->
+  <div id="moveModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3 class="modal-title">다른 랙으로 이동</h3>
+        <button id="closeMoveModal" class="close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">현재 셀 재고를 비우고 선택한 위치로 옮깁니다.</p>
+        <div class="form-group">
+          <label for="moveSheetSelect">구역(시트)</label>
+          <select id="moveSheetSelect" class="form-control"></select>
+        </div>
+        <div class="move-fields-row">
+          <div class="form-group">
+            <label for="moveRow">행</label>
+            <input type="number" id="moveRow" class="form-control" min="1" value="1">
+          </div>
+          <div class="form-group">
+            <label for="moveCol">열</label>
+            <input type="number" id="moveCol" class="form-control" min="1" value="1">
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="cancelMoveBtn" type="button" class="btn-secondary">취소</button>
+        <button id="confirmMoveBtn" type="button" class="btn-primary">이동하기</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
   <!-- Supabase JS 라이브러리 CDN 로드 및 연동 설정 파일 로드 -->
+  <script src="config.js" onerror="void 0"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="app.js?v=20260708h" defer></script>
+  <script src="app.js?v=20260708l" defer></script>
 </body>
 </html>
