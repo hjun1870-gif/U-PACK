@@ -782,23 +782,48 @@ function getLayoutMapFromDb(layoutRows) {
   return map;
 }
 
-/** DB 재고·레이아웃만으로 창고 도면 워크북 생성 (엑셀 아카이브 없을 때 모바일 복원용) */
-function createWarehouseLayoutSheet(sheetName, totalCols, maxRows) {
+/**
+ * DB 재고·레이아웃만으로 창고 도면 시트 생성
+ * layout.leftCols/rightCols가 있으면 엑셀과 같이 통로를 두고, 없으면 연속 열로 배치
+ */
+function createWarehouseLayoutSheet(sheetName, totalCols, maxRows, layout = null) {
   const sheet = {};
-  const safeCols = Math.max(4, totalCols || 11);
-  const safeRows = Math.max(4, maxRows || 18);
-  const lastColIdx = safeCols <= 9 ? 2 * safeCols : 2 * safeCols + 1;
+  let leftCols = Math.max(0, Number(layout?.leftCols) || 0);
+  let rightCols = Math.max(0, Number(layout?.rightCols) || 0);
+  let safeCols = leftCols + rightCols;
+  if (safeCols < 4) {
+    safeCols = Math.max(4, totalCols || 10);
+    leftCols = safeCols;
+    rightCols = 0;
+  }
+  const safeRows = Math.max(4, maxRows || 10);
+
+  // 연속: 1,3,5... / 통로 있음: 좌측 연속 후 2칸 건너뛰고 우측
+  const colIndices = [];
+  let p = 1;
+  for (let i = 0; i < leftCols; i++) {
+    colIndices.push(p);
+    p += 2;
+  }
+  if (rightCols > 0) {
+    p += 2; // 통로 간격
+    for (let i = 0; i < rightCols; i++) {
+      colIndices.push(p);
+      p += 2;
+    }
+  }
+  const lastColIdx = (colIndices[colIndices.length - 1] || 1) + 1;
   sheet["!ref"] = `A1:${XLSX.utils.encode_col(lastColIdx + 2)}${7 + 2 * safeRows + 2}`;
   sheet["C4"] = { t: "s", v: `<재고조사표 - ${sheetName}>` };
 
-  for (let c = 1; c <= safeCols; c++) {
-    const pColIdx = c <= 9 ? 2 * c - 1 : 2 * c + 1;
+  colIndices.forEach((pColIdx, idx) => {
+    const rackNo = idx + 1;
     const bColIdx = pColIdx + 1;
-    sheet[XLSX.utils.encode_cell({ r: 4, c: pColIdx })] = { t: "n", v: c };
+    sheet[XLSX.utils.encode_cell({ r: 4, c: pColIdx })] = { t: "n", v: rackNo };
     sheet[XLSX.utils.encode_cell({ r: 5, c: pColIdx })] = { t: "s", v: "제품" };
     sheet[XLSX.utils.encode_cell({ r: 6, c: pColIdx })] = { t: "s", v: "P" };
     sheet[XLSX.utils.encode_cell({ r: 6, c: bColIdx })] = { t: "s", v: "B" };
-  }
+  });
   for (let r = 1; r <= safeRows; r++) {
     sheet[XLSX.utils.encode_cell({ r: 7 + 2 * (r - 1), c: 0 })] = { t: "n", v: r };
   }
@@ -823,18 +848,18 @@ function buildWorkbookFromDbInventory(dbRacks, layoutRows = []) {
     const layout = layoutMap[sheetName];
     const maxRow =
       layout?.maxRows ||
-      (racks.length ? Math.max(18, ...racks.map((r) => r.rack_row)) : 18);
+      (racks.length ? Math.max(...racks.map((r) => r.rack_row)) : 10);
     let totalCols;
     if (layout?.leftCols || layout?.rightCols) {
-      totalCols = (layout.leftCols || 0) + (layout.rightCols || 0) || 11;
+      totalCols = (layout.leftCols || 0) + (layout.rightCols || 0) || 10;
     } else if (racks.length) {
-      totalCols = Math.max(11, ...racks.map((r) => r.rack_col));
+      totalCols = Math.max(...racks.map((r) => r.rack_col));
     } else {
-      totalCols = 11;
+      totalCols = 10;
     }
     XLSX.utils.book_append_sheet(
       wb,
-      createWarehouseLayoutSheet(sheetName, totalCols, maxRow),
+      createWarehouseLayoutSheet(sheetName, totalCols, maxRow, layout),
       sheetName
     );
   });
@@ -1609,6 +1634,8 @@ function updateSheetDropdown(sheetNames) {
 
 /**
  * 랙 목록을 좌/우 영역으로 분할
+ * - 엑셀에 실제 통로 간격(열 인덱스 gap > 2)이 있을 때만 좌/우로 나눔
+ * - 간격이 없으면 한 블록(좌측)으로 유지 — 임의로 절반 분할하지 않음
  */
 function splitRacksByAisle(allRacks) {
   const leftRacks = [];
@@ -1618,7 +1645,7 @@ function splitRacksByAisle(allRacks) {
     return { leftRacks, rightRacks };
   }
 
-  let splitIndex = 0;
+  let splitIndex = -1;
   let maxGap = 0;
 
   for (let i = 0; i < allRacks.length - 1; i++) {
@@ -1629,8 +1656,9 @@ function splitRacksByAisle(allRacks) {
     }
   }
 
-  if (maxGap <= 2) {
-    splitIndex = Math.floor(allRacks.length / 2) - 1;
+  // 연속 배치(P열 간격 2)면 통로 없음 → 전체를 단일 블록으로
+  if (maxGap <= 2 || splitIndex < 0) {
+    return { leftRacks: allRacks.slice(), rightRacks: [] };
   }
 
   for (let i = 0; i <= splitIndex; i++) {
@@ -1684,19 +1712,14 @@ function detectRacksFromProductHeaders(sheet, range) {
 }
 
 /**
- * 데모/기본 레이아웃 (18열 대칭)
+ * 데모/기본 레이아웃 — 업로드 시트 감지 실패 시에만 사용 (작은 연속 격자)
  */
 function createDefaultRackLayout() {
   const leftRacks = [];
-  const rightRacks = [];
-  for (let c = 1; c <= 9; c++) {
+  for (let c = 1; c <= 10; c++) {
     leftRacks.push({ rackNo: c, colIdx: 2 * c - 1 });
   }
-  for (let i = 0; i < 9; i++) {
-    const c = 10 + i;
-    rightRacks.push({ rackNo: 9 - i, colIdx: 2 * c + 1 });
-  }
-  return { leftRacks, rightRacks };
+  return { leftRacks, rightRacks: [] };
 }
 
 /**
@@ -1762,7 +1785,7 @@ function detectMaxCols(sheet) {
  * @returns {number} 최대 행 번호 (감지 실패 시 기본값 18)
  */
 function detectMaxRows(sheet) {
-  if (!sheet || !sheet["!ref"]) return 18;
+  if (!sheet || !sheet["!ref"]) return 10;
 
   try {
     const range = XLSX.utils.decode_range(sheet["!ref"]);
@@ -1788,10 +1811,10 @@ function detectMaxRows(sheet) {
       if (maxRowVal > 0 && consecutiveMisses >= 3) break;
     }
 
-    return maxRowVal || 18;
+    return maxRowVal || 10;
   } catch (e) {
     console.error("최대 행 수 감지 오류:", e);
-    return 18;
+    return 10;
   }
 }
 
@@ -1808,7 +1831,7 @@ function renderActiveSheet(sheetName) {
   searchInput.value = "";
   hideSearchAutocomplete();
 
-  // 동적으로 랙의 좌측/우측 배치 구조와 순서 배열 파악
+  // 동적으로 랙의 좌측/우측 배치 구조와 순서 배열 파악 (업로드 엑셀 기준)
   const { leftRacks, rightRacks } = detectRacks(sheet);
 
   const leftCols = leftRacks.length;
@@ -1816,17 +1839,22 @@ function renderActiveSheet(sheetName) {
   const maxRows = detectMaxRows(sheet);
   const displayTitle = parseSheetDisplayTitle(sheet, sheetName);
   const totalCols = leftCols + rightCols;
+  const hasAisle = rightCols > 0;
 
   // CSS Grid 컬럼·행 — 업로드된 시트의 실제 랙/행 수에 맞춰 동적 구성
-  gridBoard.style.gridTemplateColumns = `40px repeat(${leftCols}, minmax(52px, 1fr)) 50px repeat(${rightCols}, minmax(52px, 1fr)) 40px`;
+  gridBoard.style.gridTemplateColumns = hasAisle
+    ? `40px repeat(${leftCols}, minmax(52px, 1fr)) 50px repeat(${rightCols}, minmax(52px, 1fr)) 40px`
+    : `40px repeat(${totalCols}, minmax(52px, 1fr)) 40px`;
   if (!isMobileViewport()) {
-    gridBoard.style.maxWidth = totalCols <= 14 ? "1100px" : totalCols <= 16 ? "1250px" : "1400px";
+    gridBoard.style.maxWidth = totalCols <= 10 ? "960px" : totalCols <= 14 ? "1100px" : totalCols <= 16 ? "1250px" : "1400px";
   }
   applyResponsiveGridLayout(totalCols);
   gridBoard.dataset.sheetName = sheetName;
   gridBoard.dataset.layout = `${leftCols}+${rightCols}x${maxRows}`;
 
-  layoutInfoEl.textContent = `${displayTitle} · 좌${leftCols} / 우${rightCols}열 × ${maxRows}행`;
+  layoutInfoEl.textContent = hasAisle
+    ? `${displayTitle} · 좌${leftCols} / 우${rightCols}열 × ${maxRows}행`
+    : `${displayTitle} · ${totalCols}열 × ${maxRows}행`;
 
   // 상단 축 랙 번호 인덱스 라벨 렌더링
   renderGridHeaders(leftRacks, rightRacks);
@@ -1870,43 +1898,44 @@ function renderActiveSheet(sheetName) {
       if (cellData.product || cellData.pallet > 0 || cellData.box > 0) stockedRacks++;
     });
 
-    // 중앙 통로 셀 생성 (위치: leftCols + 2번째 컬럼)
-    const aisle = document.createElement("div");
-    const aisleColIdx = leftCols + 2;
-    aisle.style.gridColumn = `${aisleColIdx} / ${aisleColIdx + 1}`;
+    // 엑셀에 통로가 있을 때만 중앙 통로·우측 랙 렌더
+    if (hasAisle) {
+      const aisle = document.createElement("div");
+      const aisleColIdx = leftCols + 2;
+      aisle.style.gridColumn = `${aisleColIdx} / ${aisleColIdx + 1}`;
 
-    if (r === maxRows) {
-      aisle.className = "aisle-cell entrance-gate";
-      const arrow = document.createElement("div");
-      arrow.className = "entrance-arrow";
-      arrow.innerHTML = `
-        <svg viewBox="0 0 24 24">
-          <path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/>
-        </svg>
-        <span>${displayTitle}</span>
-      `;
-      aisle.appendChild(arrow);
-    } else {
-      aisle.className = "aisle-cell entrance-path";
-    }
-    gridBoard.appendChild(aisle);
-
-    // 우측 영역 랙들 렌더링 (물리적 순번 leftCols + 1 ~ leftCols + rightCols)
-    rightRacks.forEach((rackInfo, idx) => {
-      const colSeq = leftCols + idx + 1; // 1-based 물리적 순번
-      const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
-      const zoneClass = resolveZoneClass(sheet, prodRowIdx, rackInfo.colIdx);
-      const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass, duplicateMap);
-      gridBoard.appendChild(cellEl);
-      applyRackFilterToCell(cellEl, cellData);
-
-      if (cellData.product) {
-        totalProducts++;
-        totalPallets += cellData.pallet;
-        totalBoxes += cellData.box;
+      if (r === maxRows) {
+        aisle.className = "aisle-cell entrance-gate";
+        const arrow = document.createElement("div");
+        arrow.className = "entrance-arrow";
+        arrow.innerHTML = `
+          <svg viewBox="0 0 24 24">
+            <path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/>
+          </svg>
+          <span>${displayTitle}</span>
+        `;
+        aisle.appendChild(arrow);
+      } else {
+        aisle.className = "aisle-cell entrance-path";
       }
-      if (cellData.product || cellData.pallet > 0 || cellData.box > 0) stockedRacks++;
-    });
+      gridBoard.appendChild(aisle);
+
+      rightRacks.forEach((rackInfo, idx) => {
+        const colSeq = leftCols + idx + 1;
+        const cellData = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+        const zoneClass = resolveZoneClass(sheet, prodRowIdx, rackInfo.colIdx);
+        const cellEl = createRackCellElement(r, colSeq, cellData, rackInfo.rackNo, zoneClass, duplicateMap);
+        gridBoard.appendChild(cellEl);
+        applyRackFilterToCell(cellEl, cellData);
+
+        if (cellData.product) {
+          totalProducts++;
+          totalPallets += cellData.pallet;
+          totalBoxes += cellData.box;
+        }
+        if (cellData.product || cellData.pallet > 0 || cellData.box > 0) stockedRacks++;
+      });
+    }
 
     // 오른쪽 행 번호 라벨 생성
     const rightRowLabel = document.createElement("div");
@@ -2056,12 +2085,10 @@ function createRackCellElement(row, col, cellData, rackNo, zoneClass = "", dupli
  * 격자 상단 인덱스 라벨들 생성 함수
  */
 function renderGridHeaders(leftRacks, rightRacks) {
-  // 첫 칸 빈자리 (행 라벨 공간)
   const emptyLeft = document.createElement("div");
   emptyLeft.className = "col-label empty-header";
   gridBoard.appendChild(emptyLeft);
 
-  // 좌측 랙 영역 상단 라벨 (실제 랙 번호 시퀀스)
   leftRacks.forEach((rackInfo) => {
     const label = document.createElement("div");
     label.className = "col-label";
@@ -2069,17 +2096,18 @@ function renderGridHeaders(leftRacks, rightRacks) {
     gridBoard.appendChild(label);
   });
 
-  const emptyCenter = document.createElement("div");
-  emptyCenter.className = "col-label empty-header";
-  gridBoard.appendChild(emptyCenter);
+  if (rightRacks.length > 0) {
+    const emptyCenter = document.createElement("div");
+    emptyCenter.className = "col-label empty-header";
+    gridBoard.appendChild(emptyCenter);
 
-  // 우측 랙 영역 상단 라벨 (실제 랙 번호 시퀀스)
-  rightRacks.forEach((rackInfo) => {
-    const label = document.createElement("div");
-    label.className = "col-label";
-    label.textContent = rackInfo.rackNo;
-    gridBoard.appendChild(label);
-  });
+    rightRacks.forEach((rackInfo) => {
+      const label = document.createElement("div");
+      label.className = "col-label";
+      label.textContent = rackInfo.rackNo;
+      gridBoard.appendChild(label);
+    });
+  }
 
   const emptyRight = document.createElement("div");
   emptyRight.className = "col-label empty-header";
@@ -2094,7 +2122,6 @@ function renderGridFooters(leftRacks, rightRacks) {
   emptyLeft.className = "col-label empty-footer";
   gridBoard.appendChild(emptyLeft);
 
-  // 좌측 하단 라벨 (상단과 동일한 실제 랙 번호 시퀀스)
   leftRacks.forEach((rackInfo) => {
     const label = document.createElement("div");
     label.className = "col-label";
@@ -2102,17 +2129,18 @@ function renderGridFooters(leftRacks, rightRacks) {
     gridBoard.appendChild(label);
   });
 
-  const emptyCenter = document.createElement("div");
-  emptyCenter.className = "col-label empty-footer";
-  gridBoard.appendChild(emptyCenter);
+  if (rightRacks.length > 0) {
+    const emptyCenter = document.createElement("div");
+    emptyCenter.className = "col-label empty-footer";
+    gridBoard.appendChild(emptyCenter);
 
-  // 우측 하단 라벨 (상단과 동일한 실제 랙 번호 시퀀스)
-  rightRacks.forEach((rackInfo) => {
-    const label = document.createElement("div");
-    label.className = "col-label";
-    label.textContent = rackInfo.rackNo;
-    gridBoard.appendChild(label);
-  });
+    rightRacks.forEach((rackInfo) => {
+      const label = document.createElement("div");
+      label.className = "col-label";
+      label.textContent = rackInfo.rackNo;
+      gridBoard.appendChild(label);
+    });
+  }
 
   const emptyRight = document.createElement("div");
   emptyRight.className = "col-label empty-footer";
@@ -2827,16 +2855,18 @@ function applyOriginalSheetDimensions(ws, sourceSheet, reportData, layout) {
     setCol(rackPCol("right", idx) + 1, bW, MIN.b);
   });
 
-  // 통로
-  const aisleCols = useDims ? [...getAisleColumnSet(sourceSheet)].sort((a, b) => a - b) : [];
-  let aisleWidth = MIN.aisle;
-  if (aisleCols.length) {
-    aisleWidth = Math.max(
-      MIN.aisle,
-      aisleCols.reduce((sum, c) => sum + getSourceColWidth(sourceSheet, c, MIN.aisle), 0)
-    );
+  // 통로 (엑셀에 통로가 있을 때만)
+  if (aisleCol != null) {
+    const aisleCols = useDims ? [...getAisleColumnSet(sourceSheet)].sort((a, b) => a - b) : [];
+    let aisleWidth = MIN.aisle;
+    if (aisleCols.length) {
+      aisleWidth = Math.max(
+        MIN.aisle,
+        aisleCols.reduce((sum, c) => sum + getSourceColWidth(sourceSheet, c, MIN.aisle), 0)
+      );
+    }
+    setCol(aisleCol, aisleWidth, MIN.aisle);
   }
-  setCol(aisleCol, aisleWidth, MIN.aisle);
 
   // 행 높이 — 원본 타이틀/헤더/데이터 행 높이 매핑
   // 원본: 3행 부제(~), 4행 제목, 5행 열번호, 6행 제품, 7행 P/B, 8행~ 데이터
@@ -2880,10 +2910,13 @@ function paintWarehouseSheetLikeHtml(ws, reportData, sourceSheet, dimSourceSheet
   const font = (opts) => ({ name: "맑은 고딕", size: 9, ...opts });
   const center = { vertical: "middle", horizontal: "center", wrapText: true };
 
+  const hasAisle = rightRacks.length > 0;
   const leftStartCol = 2; // A=행번호
-  const aisleCol = leftStartCol + leftRacks.length * 2;
-  const rightStartCol = aisleCol + 1;
-  const rightLabelCol = rightStartCol + rightRacks.length * 2;
+  const aisleCol = hasAisle ? leftStartCol + leftRacks.length * 2 : null;
+  const rightStartCol = hasAisle ? aisleCol + 1 : leftStartCol;
+  const rightLabelCol = hasAisle
+    ? rightStartCol + rightRacks.length * 2
+    : leftStartCol + leftRacks.length * 2;
   const lastCol = rightLabelCol;
 
   const rackPCol = (side, idx) =>
@@ -2916,7 +2949,10 @@ function paintWarehouseSheetLikeHtml(ws, reportData, sourceSheet, dimSourceSheet
 
   ws.mergeCells(2, 1, 2, lastCol);
   const subCell = ws.getCell(2, 1);
-  subCell.value = `${headerLabel || sheetName} · 좌${leftCols} / 우${rightRacks.length}열 × ${maxRows}행   │   P=파렛트  B=박스`;
+  const layoutLabel = hasAisle
+    ? `좌${leftCols} / 우${rightRacks.length}열 × ${maxRows}행`
+    : `${leftCols + rightRacks.length}열 × ${maxRows}행`;
+  subCell.value = `${headerLabel || sheetName} · ${layoutLabel}   │   P=파렛트  B=박스`;
   subCell.font = font({ size: 8, color: { argb: "FF475569" } });
   subCell.alignment = center;
 
@@ -2962,38 +2998,40 @@ function paintWarehouseSheetLikeHtml(ws, reportData, sourceSheet, dimSourceSheet
     styleHeadLight(ws.getCell(prodHeadRow, c + 1));
   });
 
-  // 통로 (헤더~데이터 끝까지 병합)
   const lastDataExcelRow = dataStartRow + maxRows * 2 - 1;
-  ws.mergeCells(headRow, aisleCol, lastDataExcelRow, aisleCol);
-  const aisleCell = ws.getCell(headRow, aisleCol);
-  aisleCell.value = "통로";
-  aisleCell.fill = fill(aisleBg);
-  aisleCell.font = font({ bold: true, size: 8, color: { argb: "FF64748B" } });
-  aisleCell.alignment = { vertical: "middle", horizontal: "center", textRotation: 90 };
-  aisleCell.border = border;
+  if (hasAisle && aisleCol != null) {
+    // 통로 (헤더~데이터 끝까지 병합)
+    ws.mergeCells(headRow, aisleCol, lastDataExcelRow, aisleCol);
+    const aisleCell = ws.getCell(headRow, aisleCol);
+    aisleCell.value = "통로";
+    aisleCell.fill = fill(aisleBg);
+    aisleCell.font = font({ bold: true, size: 8, color: { argb: "FF64748B" } });
+    aisleCell.alignment = { vertical: "middle", horizontal: "center", textRotation: 90 };
+    aisleCell.border = border;
 
-  // 우측 랙 헤더
-  rightRacks.forEach((rack, idx) => {
-    const c = rackPCol("right", idx);
-    ws.mergeCells(headRow, c, headRow, c + 1);
-    const numCell = ws.getCell(headRow, c);
-    numCell.value = rack.rackNo;
-    styleHeadNavy(numCell);
-    styleHeadNavy(ws.getCell(headRow, c + 1));
+    // 우측 랙 헤더
+    rightRacks.forEach((rack, idx) => {
+      const c = rackPCol("right", idx);
+      ws.mergeCells(headRow, c, headRow, c + 1);
+      const numCell = ws.getCell(headRow, c);
+      numCell.value = rack.rackNo;
+      styleHeadNavy(numCell);
+      styleHeadNavy(ws.getCell(headRow, c + 1));
 
-    const pCell = ws.getCell(pbRow, c);
-    const bCell = ws.getCell(pbRow, c + 1);
-    pCell.value = "P";
-    bCell.value = "B";
-    styleHeadNavy(pCell);
-    styleHeadNavy(bCell);
+      const pCell = ws.getCell(pbRow, c);
+      const bCell = ws.getCell(pbRow, c + 1);
+      pCell.value = "P";
+      bCell.value = "B";
+      styleHeadNavy(pCell);
+      styleHeadNavy(bCell);
 
-    ws.mergeCells(prodHeadRow, c, prodHeadRow, c + 1);
-    const prodH = ws.getCell(prodHeadRow, c);
-    prodH.value = "제품";
-    styleHeadLight(prodH);
-    styleHeadLight(ws.getCell(prodHeadRow, c + 1));
-  });
+      ws.mergeCells(prodHeadRow, c, prodHeadRow, c + 1);
+      const prodH = ws.getCell(prodHeadRow, c);
+      prodH.value = "제품";
+      styleHeadLight(prodH);
+      styleHeadLight(ws.getCell(prodHeadRow, c + 1));
+    });
+  }
 
   // 데이터 행 (HTML과 동일: 제품행 → P/B행)
   for (let r = 1; r <= maxRows; r++) {
@@ -3668,6 +3706,7 @@ function collectWarehouseReportData(workbook, sheetName) {
 
 function buildWarehouseReportGridHtml(data) {
   const { sheet, leftRacks, rightRacks, leftCols, maxRows, colMapping } = data;
+  const hasAisle = rightRacks.length > 0;
   const rackHeader = (racks) =>
     racks
       .map((rack) => `<th colspan="2">${escapeHtml(rack.rackNo)}</th>`)
@@ -3675,23 +3714,29 @@ function buildWarehouseReportGridHtml(data) {
 
   let html = `<table class="rack-grid"><thead><tr>`;
   html += `<th class="corner"></th>${rackHeader(leftRacks)}`;
-  html += `<th class="aisle-head" rowspan="3">통<br>로</th>${rackHeader(rightRacks)}`;
+  if (hasAisle) {
+    html += `<th class="aisle-head" rowspan="3">통<br>로</th>${rackHeader(rightRacks)}`;
+  }
   html += `<th class="corner"></th></tr><tr>`;
   html += `<th class="corner"></th>`;
   leftRacks.forEach(() => {
     html += `<th>P</th><th>B</th>`;
   });
-  rightRacks.forEach(() => {
-    html += `<th>P</th><th>B</th>`;
-  });
+  if (hasAisle) {
+    rightRacks.forEach(() => {
+      html += `<th>P</th><th>B</th>`;
+    });
+  }
   html += `<th class="corner"></th></tr><tr>`;
   html += `<th class="corner"></th>`;
   leftRacks.forEach(() => {
     html += `<th class="subhead">제품</th><th class="subhead"></th>`;
   });
-  rightRacks.forEach(() => {
-    html += `<th class="subhead">제품</th><th class="subhead"></th>`;
-  });
+  if (hasAisle) {
+    rightRacks.forEach(() => {
+      html += `<th class="subhead">제품</th><th class="subhead"></th>`;
+    });
+  }
   html += `<th class="corner"></th></tr></thead><tbody>`;
 
   for (let r = 1; r <= maxRows; r++) {
@@ -3707,14 +3752,15 @@ function buildWarehouseReportGridHtml(data) {
       html += `<td class="prod ${stocked ? "stocked" : ""}" colspan="2">${escapeHtml(cell.product)}</td>`;
     });
 
-    html += `<td class="aisle"></td>`;
-
-    rightRacks.forEach((rackInfo, idx) => {
-      const colSeq = leftCols + idx + 1;
-      const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
-      const stocked = cell.product || cell.pallet > 0 || cell.box > 0;
-      html += `<td class="prod ${stocked ? "stocked" : ""}" colspan="2">${escapeHtml(cell.product)}</td>`;
-    });
+    if (hasAisle) {
+      html += `<td class="aisle"></td>`;
+      rightRacks.forEach((rackInfo, idx) => {
+        const colSeq = leftCols + idx + 1;
+        const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+        const stocked = cell.product || cell.pallet > 0 || cell.box > 0;
+        html += `<td class="prod ${stocked ? "stocked" : ""}" colspan="2">${escapeHtml(cell.product)}</td>`;
+      });
+    }
 
     html += `<td class="row-label">${r}</td></tr>`;
 
@@ -3724,12 +3770,14 @@ function buildWarehouseReportGridHtml(data) {
       const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
       html += `<td class="qty">${cell.pallet || ""}</td><td class="qty">${cell.box || ""}</td>`;
     });
-    html += `<td class="aisle"></td>`;
-    rightRacks.forEach((_, idx) => {
-      const colSeq = leftCols + idx + 1;
-      const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
-      html += `<td class="qty">${cell.pallet || ""}</td><td class="qty">${cell.box || ""}</td>`;
-    });
+    if (hasAisle) {
+      html += `<td class="aisle"></td>`;
+      rightRacks.forEach((_, idx) => {
+        const colSeq = leftCols + idx + 1;
+        const cell = getRackCellData(sheet, colMapping, r, colSeq, prodRowIdx, qtyRowIdx);
+        html += `<td class="qty">${cell.pallet || ""}</td><td class="qty">${cell.box || ""}</td>`;
+      });
+    }
     html += `<td class="row-label pb-label">P/B</td></tr>`;
   }
 
@@ -5409,16 +5457,16 @@ async function loadDataFromSupabase() {
         const layout = layoutMap[sheetName];
         const maxRow =
           layout?.maxRows ||
-          (racks.length ? Math.max(18, ...racks.map((r) => r.rack_row)) : 18);
-        let totalCols = 11;
+          (racks.length ? Math.max(...racks.map((r) => r.rack_row)) : 10);
+        let totalCols = 10;
         if (layout?.leftCols || layout?.rightCols) {
-          totalCols = (layout.leftCols || 0) + (layout.rightCols || 0) || 11;
+          totalCols = (layout.leftCols || 0) + (layout.rightCols || 0) || 10;
         } else if (racks.length) {
-          totalCols = Math.max(11, ...racks.map((r) => r.rack_col));
+          totalCols = Math.max(...racks.map((r) => r.rack_col));
         }
         XLSX.utils.book_append_sheet(
           currentWorkbook,
-          createWarehouseLayoutSheet(sheetName, totalCols, maxRow),
+          createWarehouseLayoutSheet(sheetName, totalCols, maxRow, layout),
           sheetName
         );
       });

@@ -1,0 +1,20 @@
+{
+  "name": "u-pack-main",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "test": "node scripts/test-organic-layout.js && node scripts/test-app-export-sim.js && node scripts/test-layout-regression.js && node scripts/test-export-e2e.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
+    "playwright": "^1.61.1",
+    "xlsx": "^0.18.5",
+    "xlsx-js-style": "^1.2.0"
+  }
+}
