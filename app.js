@@ -8,6 +8,8 @@
 
 // 애플리케이션 상태 관리 전역 변수
 let currentWorkbook = null; // 로드된 전체 엑셀 워크북 객체
+/** 업로드/복원한 원본 엑셀 바이트 — 다운로드 시 레이아웃·서식 유지용 */
+let pristineLayoutBytes = null;
 let productCatalogCache = [];
 let autocompleteActiveIndex = -1;
 let currentSheetName = "";  // 현재 화면에 렌더링 중인 시트 이름
@@ -480,19 +482,32 @@ function openWorkbookIdb() {
   });
 }
 
-async function saveWorkbookToLocalCache(workbook) {
-  if (!workbook) return;
+async function saveBytesToLocalCache(bytes) {
+  if (!bytes || bytes.length < 100) return;
   try {
-    const bytes = workbookToBytes(workbook);
+    const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     const db = await openWorkbookIdb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(WORKBOOK_IDB_STORE, "readwrite");
-      tx.objectStore(WORKBOOK_IDB_STORE).put(bytes, WORKBOOK_IDB_KEY);
+      tx.objectStore(WORKBOOK_IDB_STORE).put(payload, WORKBOOK_IDB_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
     db.close();
     localStorage.setItem("workbook_cache_active", "true");
+  } catch (e) {
+    console.warn("로컬 워크북 캐시 저장 실패:", e);
+  }
+}
+
+async function saveWorkbookToLocalCache(workbook) {
+  if (pristineLayoutBytes && pristineLayoutBytes.length > 100) {
+    await saveBytesToLocalCache(pristineLayoutBytes);
+    return;
+  }
+  if (!workbook) return;
+  try {
+    await saveBytesToLocalCache(workbookToBytes(workbook));
   } catch (e) {
     console.warn("로컬 워크북 캐시 저장 실패:", e);
   }
@@ -516,11 +531,11 @@ async function loadWorkbookBytesFromLocalCache() {
   }
 }
 
-async function uploadWorkbookToStorage(workbook) {
-  if (!supabaseClient || !workbook) return false;
+async function uploadRawWorkbookBytesToStorage(bytes) {
+  if (!supabaseClient || !bytes || bytes.length < 100) return false;
   try {
-    const bytes = workbookToBytes(workbook);
-    const blob = new Blob([bytes], {
+    const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const blob = new Blob([payload], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     });
     const { error } = await supabaseClient.storage
@@ -528,6 +543,19 @@ async function uploadWorkbookToStorage(workbook) {
       .upload(WORKBOOK_STORAGE_PATH, blob, { upsert: true, contentType: blob.type });
     if (error) throw error;
     return true;
+  } catch (e) {
+    console.warn("Supabase Storage 워크북 업로드 실패 (로컬 캐시는 유지됩니다):", e);
+    return false;
+  }
+}
+
+async function uploadWorkbookToStorage(workbook) {
+  if (pristineLayoutBytes && pristineLayoutBytes.length > 100) {
+    return uploadRawWorkbookBytesToStorage(pristineLayoutBytes);
+  }
+  if (!supabaseClient || !workbook) return false;
+  try {
+    return await uploadRawWorkbookBytesToStorage(workbookToBytes(workbook));
   } catch (e) {
     console.warn("Supabase Storage 워크북 업로드 실패 (로컬 캐시는 유지됩니다):", e);
     return false;
@@ -548,12 +576,11 @@ async function downloadWorkbookBytesFromStorage() {
   }
 }
 
-async function uploadWorkbookToSnapshotTable(workbook) {
-  if (!supabaseClient || !workbook) return false;
+async function uploadRawWorkbookBytesToSnapshotTable(bytes) {
+  if (!supabaseClient || !bytes || bytes.length < 100) return false;
   try {
-    const bytes = workbookToArchiveBytes(workbook);
-    if (!bytes || bytes.length < 100) throw new Error("엑셀 변환 결과가 비어 있습니다.");
-    const base64 = uint8ArrayToBase64(bytes);
+    const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const base64 = uint8ArrayToBase64(payload);
     const { error } = await supabaseClient.from("workbook_snapshot").upsert(
       {
         id: WORKBOOK_SNAPSHOT_ID,
@@ -564,6 +591,22 @@ async function uploadWorkbookToSnapshotTable(workbook) {
     );
     if (error) throw error;
     return true;
+  } catch (e) {
+    console.warn("workbook_snapshot 테이블 저장 실패 (마이그레이션 003 미적용 시 정상):", e);
+    return false;
+  }
+}
+
+async function uploadWorkbookToSnapshotTable(workbook) {
+  if (pristineLayoutBytes && pristineLayoutBytes.length > 100) {
+    return uploadRawWorkbookBytesToSnapshotTable(pristineLayoutBytes);
+  }
+  if (!supabaseClient || !workbook) return false;
+  try {
+    // 원본 바이트가 없으면 재인코딩 (레이아웃 손실 가능)
+    const bytes = workbookToBytes(workbook);
+    if (!bytes || bytes.length < 100) throw new Error("엑셀 변환 결과가 비어 있습니다.");
+    return uploadRawWorkbookBytesToSnapshotTable(bytes);
   } catch (e) {
     console.warn("workbook_snapshot 테이블 저장 실패 (마이그레이션 003 미적용 시 정상):", e);
     return false;
@@ -587,10 +630,16 @@ async function downloadWorkbookBytesFromSnapshotTable() {
 }
 
 async function uploadWorkbookToDbSnapshot(workbook) {
-  if (!supabaseClient || !workbook) return false;
+  if (!supabaseClient) return false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const bytes = workbookToArchiveBytes(workbook);
+      // 원본 바이트 우선 — 재인코딩하면 도면 레이아웃이 깨짐
+      const bytes =
+        pristineLayoutBytes && pristineLayoutBytes.length > 100
+          ? pristineLayoutBytes
+          : workbook
+            ? workbookToArchiveBytes(workbook)
+            : null;
       if (!bytes || bytes.length < 100) throw new Error("엑셀 변환 결과가 비어 있습니다.");
 
       const base64 = uint8ArrayToBase64(bytes);
@@ -759,18 +808,29 @@ function createWarehouseLayoutSheet(sheetName, totalCols, maxRows) {
 function buildWorkbookFromDbInventory(dbRacks, layoutRows = []) {
   const inventory = getInventoryRacks(dbRacks);
   const layoutMap = getLayoutMapFromDb(layoutRows);
-  const sheetNames = [...new Set(inventory.map((r) => r.sheet_name))].filter(Boolean);
+  // 레이아웃에만 있고 재고가 비어 있는 구역(B1/B2/B3 등)도 시트 목록에 포함
+  const layoutSheetNames = (layoutRows || [])
+    .slice()
+    .sort((a, b) => (a.rack_row || 0) - (b.rack_row || 0))
+    .map((row) => row.product_name)
+    .filter(Boolean);
+  const inventorySheetNames = [...new Set(inventory.map((r) => r.sheet_name))].filter(Boolean);
+  const sheetNames = [...new Set([...layoutSheetNames, ...inventorySheetNames])];
   const wb = XLSX.utils.book_new();
 
   sheetNames.forEach((sheetName) => {
     const racks = inventory.filter((r) => r.sheet_name === sheetName);
     const layout = layoutMap[sheetName];
-    const maxRow = layout?.maxRows || Math.max(18, ...racks.map((r) => r.rack_row));
+    const maxRow =
+      layout?.maxRows ||
+      (racks.length ? Math.max(18, ...racks.map((r) => r.rack_row)) : 18);
     let totalCols;
-    if (layout?.leftCols && layout?.rightCols) {
-      totalCols = layout.leftCols + layout.rightCols;
-    } else {
+    if (layout?.leftCols || layout?.rightCols) {
+      totalCols = (layout.leftCols || 0) + (layout.rightCols || 0) || 11;
+    } else if (racks.length) {
       totalCols = Math.max(11, ...racks.map((r) => r.rack_col));
+    } else {
+      totalCols = 11;
     }
     XLSX.utils.book_append_sheet(
       wb,
@@ -793,17 +853,18 @@ function getSheetMismatch(dbRacks, workbook) {
 }
 
 async function tryLoadArchivedWorkbookBytes() {
-  const snapshotBytes = await downloadWorkbookBytesFromSnapshotTable();
-  if (snapshotBytes) return { bytes: snapshotBytes, source: "snapshot" };
-
+  // Storage·로컬 캐시는 서식 포함 가능성이 높아 우선 사용
   const storageBytes = await downloadWorkbookBytesFromStorage();
   if (storageBytes) return { bytes: storageBytes, source: "storage" };
 
-  const dbSnapshotBytes = await downloadWorkbookBytesFromDbSnapshot();
-  if (dbSnapshotBytes) return { bytes: dbSnapshotBytes, source: "db" };
+  const snapshotBytes = await downloadWorkbookBytesFromSnapshotTable();
+  if (snapshotBytes) return { bytes: snapshotBytes, source: "snapshot" };
 
   const cacheBytes = await loadWorkbookBytesFromLocalCache();
   if (cacheBytes) return { bytes: cacheBytes, source: "cache" };
+
+  const dbSnapshotBytes = await downloadWorkbookBytesFromDbSnapshot();
+  if (dbSnapshotBytes) return { bytes: dbSnapshotBytes, source: "db" };
 
   return null;
 }
@@ -1202,6 +1263,7 @@ function loadWorkbookFromFile(file) {
   reader.onload = function (e) {
     const data = new Uint8Array(e.target.result);
     try {
+      rememberPristineLayoutBytes(data);
       const workbook = XLSX.read(data, { type: "array", cellStyles: true });
       applyLoadedWorkbook(workbook, undefined, true);
       showToast("엑셀 파일을 불러왔습니다.", "success");
@@ -1287,6 +1349,7 @@ function handleFileSelect(e) {
  * 데모용 가상 엑셀 워크북을 동적으로 생성하여 로드합니다.
  */
 function loadDemoWorkbook() {
+  pristineLayoutBytes = null;
   const wb = XLSX.utils.book_new();
   const sheetB2 = createMockSheet("B2");
   XLSX.utils.book_append_sheet(wb, sheetB2, "B2");
@@ -1294,6 +1357,117 @@ function loadDemoWorkbook() {
   XLSX.utils.book_append_sheet(wb, sheetB1, "B1");
   applyLoadedWorkbook(wb, resolveDefaultSheetName(wb), false);
   showToast("데모 데이터를 불러왔습니다.", "info");
+}
+
+function rememberPristineLayoutBytes(bytes) {
+  if (!bytes || bytes.length < 100) {
+    pristineLayoutBytes = null;
+    return;
+  }
+  pristineLayoutBytes = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+}
+
+/** 다운로드용 원본으로 쓸 만큼 랙 열이 충분한지 검사 (DB 1열 도면 거부) */
+function isWorkbookLayoutHealthy(bytesOrWorkbook) {
+  try {
+    const wb =
+      bytesOrWorkbook && bytesOrWorkbook.SheetNames
+        ? bytesOrWorkbook
+        : XLSX.read(bytesOrWorkbook, { type: "array", cellStyles: false });
+    const names = getWarehouseSheetNames(wb);
+    if (names.length === 0) return false;
+    // 창고 시트 중 하나라도 랙 5열 이상이면 정상 도면으로 간주
+    return names.some((name) => {
+      const sheet = wb.Sheets[name];
+      return sheet && hasWarehouseLayout(sheet) && detectMaxCols(sheet) >= 5;
+    });
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 다운로드 직전에 건강한 원본 바이트 확보 (업로드본 → 번들 템플릿) */
+async function ensurePristineLayoutForExport() {
+  if (pristineLayoutBytes && isWorkbookLayoutHealthy(pristineLayoutBytes)) {
+    return "cached";
+  }
+  try {
+    const bundled = await loadBundledWorkbookBytes();
+    if (!isWorkbookLayoutHealthy(bundled)) {
+      throw new Error("기본 템플릿 레이아웃이 손상되었습니다.");
+    }
+    rememberPristineLayoutBytes(bundled);
+    return "bundled";
+  } catch (e) {
+    throw new Error(
+      "원본 도면 엑셀이 없습니다. 레이아웃이 있는 엑셀 파일을 업로드한 뒤 다시 다운로드해 주세요."
+    );
+  }
+}
+
+/**
+ * 원본 레이아웃 워크북에 현재 재고 값만 덮어씀 (병합·열너비·색상 등 서식 유지)
+ */
+function overlayWarehouseInventoryValues(sourceWb, targetWb) {
+  if (!sourceWb || !targetWb) return;
+
+  getWarehouseSheetNames(sourceWb).forEach((sheetName) => {
+    const src = sourceWb.Sheets[sheetName];
+    const dst = targetWb.Sheets[sheetName];
+    if (!src || !dst || !hasWarehouseLayout(src) || !hasWarehouseLayout(dst)) return;
+
+    const maxCols = detectMaxCols(src);
+    const maxRows = detectMaxRows(src);
+    const colMapping = detectColumnMapping(src, maxCols);
+
+    for (let r = 1; r <= maxRows; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      const qtyRowIdx = 8 + 2 * (r - 1);
+
+      for (let c = 1; c <= maxCols; c++) {
+        const pCol = colMapping[c];
+        if (pCol === undefined) continue;
+        const bCol = pCol + 1;
+        copyCellValueKeepStyle(src, dst, XLSX.utils.encode_cell({ r: prodRowIdx, c: pCol }));
+        copyCellValueKeepStyle(src, dst, XLSX.utils.encode_cell({ r: qtyRowIdx, c: pCol }));
+        copyCellValueKeepStyle(src, dst, XLSX.utils.encode_cell({ r: qtyRowIdx, c: bCol }));
+      }
+    }
+  });
+}
+
+/** 셀 값만 복사하고 대상 셀의 기존 서식(.s)은 유지 */
+function copyCellValueKeepStyle(srcSheet, dstSheet, addr) {
+  const srcCell = srcSheet[addr];
+  const srcVal = srcCell?.v;
+  const isEmpty =
+    srcCell == null ||
+    srcVal === undefined ||
+    srcVal === null ||
+    (typeof srcVal === "string" && srcVal.trim() === "");
+
+  if (isEmpty) {
+    if (!dstSheet[addr]) return;
+    const keepStyle = dstSheet[addr].s;
+    dstSheet[addr].v = "";
+    dstSheet[addr].t = "s";
+    delete dstSheet[addr].w;
+    delete dstSheet[addr].f;
+    if (keepStyle) dstSheet[addr].s = keepStyle;
+    return;
+  }
+
+  const type = srcCell.t || (typeof srcVal === "number" ? "n" : "s");
+  if (!dstSheet[addr]) {
+    dstSheet[addr] = { t: type, v: srcVal };
+  } else {
+    const keepStyle = dstSheet[addr].s;
+    dstSheet[addr].t = type;
+    dstSheet[addr].v = srcVal;
+    delete dstSheet[addr].w;
+    delete dstSheet[addr].f;
+    if (keepStyle) dstSheet[addr].s = keepStyle;
+  }
 }
 
 /**
@@ -2443,18 +2617,647 @@ function updateExcelCellValue(sheet, address, val, type) {
 }
 
 /**
- * 6. 수정된 파일 export (다운로드)
+ * ExcelJS 셀에 SheetJS 셀 값을 넣되, 기존 스타일·병합은 건드리지 않음
  */
-function exportUpdatedExcel() {
+function setExcelJsCellValue(ws, row0, col0, srcCell) {
+  const cell = ws.getCell(row0 + 1, col0 + 1);
+  const val = srcCell?.v;
+  const isEmpty =
+    srcCell == null ||
+    val === undefined ||
+    val === null ||
+    (typeof val === "string" && val.trim() === "");
+
+  if (isEmpty) {
+    cell.value = null;
+    return;
+  }
+  if (srcCell.f) {
+    cell.value = { formula: String(srcCell.f).replace(/^=/, "") };
+    return;
+  }
+  if (srcCell.t === "n" || typeof val === "number") {
+    cell.value = Number(val) || 0;
+    return;
+  }
+  cell.value = String(val);
+}
+
+/**
+ * 원본 xlsx 바이트를 ExcelJS로 열어 재고 값만 패치 (레이아웃 재구성 없음)
+ * 셀 좌표는 원본 도면 기준, 값은 현재 워크북에서 가져온다.
+ */
+async function buildExportBufferPreservingLayout() {
+  if (!window.ExcelJS) {
+    throw new Error("ExcelJS 라이브러리를 불러오지 못했습니다. 페이지를 새로고침해 주세요.");
+  }
+  if (!pristineLayoutBytes || pristineLayoutBytes.length < 100) {
+    throw new Error("원본 엑셀이 없습니다. 레이아웃이 있는 엑셀 파일을 다시 업로드해 주세요.");
+  }
+
+  aggregateTotalSheet(currentWorkbook);
+
+  const layoutWb = XLSX.read(pristineLayoutBytes, { type: "array", cellStyles: true });
+  const excelWb = new window.ExcelJS.Workbook();
+  await excelWb.xlsx.load(pristineLayoutBytes);
+
+  getWarehouseSheetNames(layoutWb).forEach((sheetName) => {
+    const layoutSheet = layoutWb.Sheets[sheetName];
+    const dataSheet = currentWorkbook.Sheets[sheetName];
+    const ws = excelWb.getWorksheet(sheetName);
+    if (!layoutSheet || !ws || !hasWarehouseLayout(layoutSheet)) return;
+    // 현재 워크북에 해당 시트가 없으면 원본 시트 그대로 유지
+    if (!dataSheet || !hasWarehouseLayout(dataSheet)) return;
+
+    const maxCols = detectMaxCols(layoutSheet);
+    const maxRows = detectMaxRows(layoutSheet);
+    const layoutMapping = detectColumnMapping(layoutSheet, maxCols);
+    const dataMapping = detectColumnMapping(dataSheet);
+
+    for (let r = 1; r <= maxRows; r++) {
+      const prodRowIdx = 7 + 2 * (r - 1);
+      const qtyRowIdx = 8 + 2 * (r - 1);
+
+      for (let c = 1; c <= maxCols; c++) {
+        const layoutPCol = layoutMapping[c];
+        if (layoutPCol === undefined) continue;
+        const layoutBCol = layoutPCol + 1;
+
+        // 논리 랙(행/열) 기준으로 현재 재고를 읽어 원본 좌표에 기록
+        const cellData = getRackCellData(
+          dataSheet,
+          dataMapping,
+          r,
+          c,
+          prodRowIdx,
+          qtyRowIdx
+        );
+        setExcelJsCellValue(
+          ws,
+          prodRowIdx,
+          layoutPCol,
+          cellData.product ? { t: "s", v: cellData.product } : null
+        );
+        setExcelJsCellValue(
+          ws,
+          qtyRowIdx,
+          layoutPCol,
+          cellData.product || cellData.pallet
+            ? { t: "n", v: cellData.pallet || 0 }
+            : null
+        );
+        setExcelJsCellValue(
+          ws,
+          qtyRowIdx,
+          layoutBCol,
+          cellData.product || cellData.box
+            ? { t: "n", v: cellData.box || 0 }
+            : null
+        );
+      }
+    }
+  });
+
+  const totalName = currentWorkbook.SheetNames.find(
+    (n) => n.toUpperCase() === "TOTAL" || n.includes("합계")
+  );
+  const srcTotal = totalName ? currentWorkbook.Sheets[totalName] : null;
+  const wsTotal = totalName ? excelWb.getWorksheet(totalName) : null;
+  if (srcTotal && wsTotal) {
+    const lastRow = getTotalSheetLastDataRow(srcTotal);
+    for (let excelRow = TOTAL_DATA_START_ROW; excelRow <= Math.max(lastRow, TOTAL_DATA_START_ROW); excelRow++) {
+      for (let col = TOTAL_COL.PRODUCT; col <= TOTAL_COL.CHECK; col++) {
+        const addr = totalCellAddr(excelRow, col);
+        setExcelJsCellValue(wsTotal, excelRow - 1, col, srcTotal[addr] || null);
+      }
+    }
+  }
+
+  return excelWb.xlsx.writeBuffer();
+}
+
+/** 열 치수가 깨진 시트인지 (숨김·초협폭 다수) */
+function sheetHasBrokenColumnDims(sheet) {
+  const cols = sheet?.["!cols"] || [];
+  if (!cols.length) return false;
+  let bad = 0;
+  cols.forEach((c) => {
+    if (!c) return;
+    const w = c.wch != null ? c.wch : c.width;
+    if (c.hidden || (w != null && w < 3)) bad += 1;
+  });
+  return bad >= 4;
+}
+
+/** SheetJS 원본 열 너비(wch) — 숨김/초협폭은 fallback */
+function getSourceColWidth(sheet, col0, fallback = 6) {
+  const col = sheet?.["!cols"]?.[col0];
+  if (!col || col.hidden) return fallback;
+  let w = null;
+  if (col.wch != null && Number.isFinite(col.wch)) w = col.wch;
+  else if (col.width != null && Number.isFinite(col.width)) w = col.width;
+  if (w == null || w < 3) return fallback;
+  return w;
+}
+
+/** SheetJS 원본 행 높이(pt) */
+function getSourceRowHeight(sheet, row0, fallback = 15) {
+  const row = sheet?.["!rows"]?.[row0];
+  if (!row) return fallback;
+  if (row.hpt != null && Number.isFinite(row.hpt)) return row.hpt;
+  if (row.hpx != null && Number.isFinite(row.hpx)) return row.hpx * 0.75;
+  return fallback;
+}
+
+/**
+ * 원본 시트의 열너비·행높이를 HTML형 도면 좌표에 매핑
+ */
+function applyOriginalSheetDimensions(ws, sourceSheet, reportData, layout) {
+  const { leftRacks, rightRacks, maxRows } = reportData;
+  // 치수 원본 시트의 랙 좌표 기준으로 너비 조회
+  const dimMapping = hasWarehouseLayout(sourceSheet)
+    ? detectColumnMapping(sourceSheet)
+    : reportData.colMapping;
+  const {
+    aisleCol,
+    rightLabelCol,
+    rackPCol,
+    headRow,
+    pbRow,
+    prodHeadRow,
+    dataStartRow,
+  } = layout;
+
+  // 정상 원본 기준 최소 너비 (깨진 캐시·인쇄용 축소값 방지)
+  const MIN = { label: 4.5, p: 10, b: 6, aisle: 3 };
+  const setCol = (excelCol1, width, minW) => {
+    const col = ws.getColumn(excelCol1);
+    col.width = Math.max(minW, Number(width) || minW);
+    col.hidden = false;
+  };
+
+  const useDims = sourceSheet && !sheetHasBrokenColumnDims(sourceSheet);
+
+  // A열(행번호) · 우측 행번호
+  setCol(1, useDims ? getSourceColWidth(sourceSheet, 0, MIN.label) : MIN.label, MIN.label);
+  const srcLastP =
+    dimMapping[leftRacks.length + rightRacks.length] ??
+    (rightRacks[rightRacks.length - 1]?.colIdx ?? leftRacks[leftRacks.length - 1]?.colIdx ?? 0);
+  setCol(
+    rightLabelCol,
+    useDims ? getSourceColWidth(sourceSheet, srcLastP + 2, MIN.label) : MIN.label,
+    MIN.label
+  );
+
+  // 랙 P/B 열
+  leftRacks.forEach((_, idx) => {
+    const srcP = dimMapping[idx + 1];
+    const pW = useDims && srcP !== undefined ? getSourceColWidth(sourceSheet, srcP, MIN.p) : MIN.p;
+    const bW =
+      useDims && srcP !== undefined ? getSourceColWidth(sourceSheet, srcP + 1, MIN.b) : MIN.b;
+    setCol(rackPCol("left", idx), pW, MIN.p);
+    setCol(rackPCol("left", idx) + 1, bW, MIN.b);
+  });
+  rightRacks.forEach((_, idx) => {
+    const srcP = dimMapping[leftRacks.length + idx + 1];
+    const pW = useDims && srcP !== undefined ? getSourceColWidth(sourceSheet, srcP, MIN.p) : MIN.p;
+    const bW =
+      useDims && srcP !== undefined ? getSourceColWidth(sourceSheet, srcP + 1, MIN.b) : MIN.b;
+    setCol(rackPCol("right", idx), pW, MIN.p);
+    setCol(rackPCol("right", idx) + 1, bW, MIN.b);
+  });
+
+  // 통로
+  const aisleCols = useDims ? [...getAisleColumnSet(sourceSheet)].sort((a, b) => a - b) : [];
+  let aisleWidth = MIN.aisle;
+  if (aisleCols.length) {
+    aisleWidth = Math.max(
+      MIN.aisle,
+      aisleCols.reduce((sum, c) => sum + getSourceColWidth(sourceSheet, c, MIN.aisle), 0)
+    );
+  }
+  setCol(aisleCol, aisleWidth, MIN.aisle);
+
+  // 행 높이 — 원본 타이틀/헤더/데이터 행 높이 매핑
+  // 원본: 3행 부제(~), 4행 제목, 5행 열번호, 6행 제품, 7행 P/B, 8행~ 데이터
+  ws.getRow(1).height = getSourceRowHeight(sourceSheet, 3, 20); // 제목
+  ws.getRow(2).height = getSourceRowHeight(sourceSheet, 2, 14); // 부제
+  ws.getRow(3).height = getSourceRowHeight(sourceSheet, 2, 10);
+  ws.getRow(headRow).height = getSourceRowHeight(sourceSheet, 4, 13); // 열번호
+  ws.getRow(pbRow).height = getSourceRowHeight(sourceSheet, 6, 13); // P/B
+  ws.getRow(prodHeadRow).height = getSourceRowHeight(sourceSheet, 5, 13); // 제품
+
+  for (let r = 1; r <= maxRows; r++) {
+    const srcProdRowIdx = 7 + 2 * (r - 1);
+    const srcQtyRowIdx = 8 + 2 * (r - 1);
+    const prodExcelRow = dataStartRow + (r - 1) * 2;
+    const qtyExcelRow = prodExcelRow + 1;
+    ws.getRow(prodExcelRow).height = getSourceRowHeight(sourceSheet, srcProdRowIdx, 15);
+    ws.getRow(qtyExcelRow).height = getSourceRowHeight(sourceSheet, srcQtyRowIdx, 13);
+  }
+}
+
+/**
+ * HTML 보고서 도면 배치도와 동일한 격자를 Excel 시트로 그린다.
+ * 열너비·행높이는 원본(업로드) 시트 값을 매핑한다.
+ * @param dimSourceSheet 치수 참조용 원본 시트 (없으면 sourceSheet 사용)
+ */
+function paintWarehouseSheetLikeHtml(ws, reportData, sourceSheet, dimSourceSheet = null) {
+  const dimSheet = dimSourceSheet || sourceSheet;
+  const { leftRacks, rightRacks, leftCols, maxRows, colMapping, sheetName, displayTitle, headerLabel } =
+    reportData;
+  const navy = "1E3A5F";
+  const light = "DDEBF7";
+  const aisleBg = "E2E8F0";
+  const white = "FFFFFF";
+  const border = {
+    top: { style: "thin", color: { argb: "FF000000" } },
+    bottom: { style: "thin", color: { argb: "FF000000" } },
+    left: { style: "thin", color: { argb: "FF000000" } },
+    right: { style: "thin", color: { argb: "FF000000" } },
+  };
+  const fill = (hex) => ({ type: "pattern", pattern: "solid", fgColor: { argb: "FF" + hex } });
+  const font = (opts) => ({ name: "맑은 고딕", size: 9, ...opts });
+  const center = { vertical: "middle", horizontal: "center", wrapText: true };
+
+  const leftStartCol = 2; // A=행번호
+  const aisleCol = leftStartCol + leftRacks.length * 2;
+  const rightStartCol = aisleCol + 1;
+  const rightLabelCol = rightStartCol + rightRacks.length * 2;
+  const lastCol = rightLabelCol;
+
+  const rackPCol = (side, idx) =>
+    side === "left" ? leftStartCol + idx * 2 : rightStartCol + idx * 2;
+
+  const headRow = 4; // 랙 번호
+  const pbRow = 5;
+  const prodHeadRow = 6;
+  const dataStartRow = 7;
+
+  // 원본 열너비·행높이 적용 (고정값 대신)
+  applyOriginalSheetDimensions(ws, dimSheet, reportData, {
+    leftStartCol,
+    aisleCol,
+    rightStartCol,
+    rightLabelCol,
+    rackPCol,
+    headRow,
+    pbRow,
+    prodHeadRow,
+    dataStartRow,
+  });
+
+  // 제목/부제
+  ws.mergeCells(1, 1, 1, lastCol);
+  const titleCell = ws.getCell(1, 1);
+  titleCell.value = displayTitle || `<재고조사표 - ${sheetName}>`;
+  titleCell.font = font({ size: 14, bold: true, color: { argb: "FF" + navy } });
+  titleCell.alignment = center;
+
+  ws.mergeCells(2, 1, 2, lastCol);
+  const subCell = ws.getCell(2, 1);
+  subCell.value = `${headerLabel || sheetName} · 좌${leftCols} / 우${rightRacks.length}열 × ${maxRows}행   │   P=파렛트  B=박스`;
+  subCell.font = font({ size: 8, color: { argb: "FF475569" } });
+  subCell.alignment = center;
+
+  const styleHeadNavy = (cell) => {
+    cell.fill = fill(navy);
+    cell.font = font({ bold: true, color: { argb: "FFFFFFFF" }, size: 9 });
+    cell.alignment = center;
+    cell.border = border;
+  };
+  const styleHeadLight = (cell) => {
+    cell.fill = fill(light);
+    cell.font = font({ bold: true, color: { argb: "FF000000" }, size: 8 });
+    cell.alignment = center;
+    cell.border = border;
+  };
+
+  // 모서리
+  [headRow, pbRow, prodHeadRow].forEach((r) => {
+    styleHeadNavy(ws.getCell(r, 1));
+    styleHeadNavy(ws.getCell(r, rightLabelCol));
+  });
+
+  // 좌측 랙 헤더
+  leftRacks.forEach((rack, idx) => {
+    const c = rackPCol("left", idx);
+    ws.mergeCells(headRow, c, headRow, c + 1);
+    const numCell = ws.getCell(headRow, c);
+    numCell.value = rack.rackNo;
+    styleHeadNavy(numCell);
+    styleHeadNavy(ws.getCell(headRow, c + 1));
+
+    const pCell = ws.getCell(pbRow, c);
+    const bCell = ws.getCell(pbRow, c + 1);
+    pCell.value = "P";
+    bCell.value = "B";
+    styleHeadNavy(pCell);
+    styleHeadNavy(bCell);
+
+    ws.mergeCells(prodHeadRow, c, prodHeadRow, c + 1);
+    const prodH = ws.getCell(prodHeadRow, c);
+    prodH.value = "제품";
+    styleHeadLight(prodH);
+    styleHeadLight(ws.getCell(prodHeadRow, c + 1));
+  });
+
+  // 통로 (헤더~데이터 끝까지 병합)
+  const lastDataExcelRow = dataStartRow + maxRows * 2 - 1;
+  ws.mergeCells(headRow, aisleCol, lastDataExcelRow, aisleCol);
+  const aisleCell = ws.getCell(headRow, aisleCol);
+  aisleCell.value = "통로";
+  aisleCell.fill = fill(aisleBg);
+  aisleCell.font = font({ bold: true, size: 8, color: { argb: "FF64748B" } });
+  aisleCell.alignment = { vertical: "middle", horizontal: "center", textRotation: 90 };
+  aisleCell.border = border;
+
+  // 우측 랙 헤더
+  rightRacks.forEach((rack, idx) => {
+    const c = rackPCol("right", idx);
+    ws.mergeCells(headRow, c, headRow, c + 1);
+    const numCell = ws.getCell(headRow, c);
+    numCell.value = rack.rackNo;
+    styleHeadNavy(numCell);
+    styleHeadNavy(ws.getCell(headRow, c + 1));
+
+    const pCell = ws.getCell(pbRow, c);
+    const bCell = ws.getCell(pbRow, c + 1);
+    pCell.value = "P";
+    bCell.value = "B";
+    styleHeadNavy(pCell);
+    styleHeadNavy(bCell);
+
+    ws.mergeCells(prodHeadRow, c, prodHeadRow, c + 1);
+    const prodH = ws.getCell(prodHeadRow, c);
+    prodH.value = "제품";
+    styleHeadLight(prodH);
+    styleHeadLight(ws.getCell(prodHeadRow, c + 1));
+  });
+
+  // 데이터 행 (HTML과 동일: 제품행 → P/B행)
+  for (let r = 1; r <= maxRows; r++) {
+    const prodExcelRow = dataStartRow + (r - 1) * 2;
+    const qtyExcelRow = prodExcelRow + 1;
+    const srcProdRowIdx = 7 + 2 * (r - 1);
+    const srcQtyRowIdx = 8 + 2 * (r - 1);
+
+    // 행 높이는 applyOriginalSheetDimensions에서 원본값 적용
+
+    // HTML과 동일: 제품행=행번호, 수량행=P/B (병합하지 않음)
+    const leftLab = ws.getCell(prodExcelRow, 1);
+    leftLab.value = r;
+    styleHeadLight(leftLab);
+    const leftPb = ws.getCell(qtyExcelRow, 1);
+    leftPb.value = "P/B";
+    styleHeadLight(leftPb);
+
+    const rightLab = ws.getCell(prodExcelRow, rightLabelCol);
+    rightLab.value = r;
+    styleHeadLight(rightLab);
+    const rightPb = ws.getCell(qtyExcelRow, rightLabelCol);
+    rightPb.value = "P/B";
+    styleHeadLight(rightPb);
+
+    const paintRack = (side, idx, colSeq) => {
+      const c = rackPCol(side, idx);
+      const cell = getRackCellData(
+        sourceSheet,
+        colMapping,
+        r,
+        colSeq,
+        srcProdRowIdx,
+        srcQtyRowIdx
+      );
+      const stocked = !!(cell.product || cell.pallet > 0 || cell.box > 0);
+
+      ws.mergeCells(prodExcelRow, c, prodExcelRow, c + 1);
+      const prodCell = ws.getCell(prodExcelRow, c);
+      prodCell.value = cell.product || "";
+      prodCell.font = font({ bold: stocked, size: 8 });
+      prodCell.fill = fill(white);
+      prodCell.alignment = center;
+      prodCell.border = border;
+      ws.getCell(prodExcelRow, c + 1).border = border;
+      ws.getCell(prodExcelRow, c + 1).fill = fill(white);
+
+      const pCell = ws.getCell(qtyExcelRow, c);
+      const bCell = ws.getCell(qtyExcelRow, c + 1);
+      pCell.value = cell.pallet || "";
+      bCell.value = cell.box || "";
+      [pCell, bCell].forEach((qc) => {
+        qc.font = font({ size: 8 });
+        qc.fill = fill(white);
+        qc.alignment = center;
+        qc.border = border;
+      });
+    };
+
+    leftRacks.forEach((_, idx) => paintRack("left", idx, idx + 1));
+    rightRacks.forEach((_, idx) => paintRack("right", idx, leftCols + idx + 1));
+  }
+
+  ws.pageSetup = {
+    paperSize: 9,
+    orientation: "landscape",
+    fitToPage: true,
+    fitToWidth: 1,
+    fitToHeight: 1,
+    margins: { left: 0.25, right: 0.25, top: 0.3, bottom: 0.3, header: 0.1, footer: 0.1 },
+  };
+  ws.views = [{ state: "normal", showGridLines: true }];
+
+  // 셀 기록 후 치수 재적용 (ExcelJS가 덮어쓰는 경우 방지)
+  applyOriginalSheetDimensions(ws, dimSheet, reportData, {
+    leftStartCol,
+    aisleCol,
+    rightStartCol,
+    rightLabelCol,
+    rackPCol,
+    headRow,
+    pbRow,
+    prodHeadRow,
+    dataStartRow,
+  });
+}
+
+/** SheetJS 시트를 ExcelJS로 값 복사 (TOTAL·입수량 등) */
+function copySheetJsToExcelJsWorksheet(sheetJs, ws) {
+  if (!sheetJs || !sheetJs["!ref"]) return;
+  const range = XLSX.utils.decode_range(sheetJs["!ref"]);
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const src = sheetJs[XLSX.utils.encode_cell({ r, c })];
+      if (!src || src.v === undefined) continue;
+      const cell = ws.getCell(r + 1, c + 1);
+      if (src.f) cell.value = { formula: String(src.f).replace(/^=/, "") };
+      else if (src.t === "n" || typeof src.v === "number") cell.value = Number(src.v) || 0;
+      else cell.value = String(src.v);
+    }
+  }
+  (sheetJs["!merges"] || []).forEach((m) => {
+    try {
+      ws.mergeCells(m.s.r + 1, m.s.c + 1, m.e.r + 1, m.e.c + 1);
+    } catch (_) {
+      /* 중복 병합 무시 */
+    }
+  });
+  const cols = sheetJs["!cols"] || [];
+  cols.forEach((col, idx) => {
+    if (!col) return;
+    ws.getColumn(idx + 1).width = col.wch || col.width || 10;
+    ws.getColumn(idx + 1).hidden = false;
+  });
+}
+
+/**
+ * HTML 도면과 같은 레이아웃으로 엑셀 버퍼 생성
+ */
+async function buildExportBufferMatchingHtmlLayout() {
+  if (!window.ExcelJS) {
+    throw new Error("ExcelJS 라이브러리를 불러오지 못했습니다. 페이지를 새로고침(Ctrl+F5)해 주세요.");
+  }
+  if (!currentWorkbook) {
+    throw new Error("내보낼 워크북이 없습니다.");
+  }
+
+  aggregateTotalSheet(currentWorkbook);
+  const excelWb = new window.ExcelJS.Workbook();
+  excelWb.creator = "U-PACK";
+  excelWb.created = new Date();
+
+  // 열너비·행높이 참조: 깨진 캐시보다 번들(정상 템플릿) 우선
+  let dimWorkbook = null;
+  try {
+    const bundledBytes = await loadBundledWorkbookBytes();
+    if (isWorkbookLayoutHealthy(bundledBytes)) {
+      dimWorkbook = XLSX.read(bundledBytes, { type: "array", cellStyles: true });
+    }
+  } catch (_) {
+    dimWorkbook = null;
+  }
+  try {
+    await ensurePristineLayoutForExport();
+    if (pristineLayoutBytes && isWorkbookLayoutHealthy(pristineLayoutBytes)) {
+      const uploaded = XLSX.read(pristineLayoutBytes, { type: "array", cellStyles: true });
+      // 업로드본 치수가 정상일 때만 사용 (숨김/초협폭 캐시 제외)
+      const sample = uploaded.Sheets[uploaded.SheetNames[0]];
+      if (sample && !sheetHasBrokenColumnDims(sample)) {
+        dimWorkbook = uploaded;
+      }
+    }
+  } catch (_) {
+    /* keep bundled dims */
+  }
+
+  currentWorkbook.SheetNames.forEach((sheetName) => {
+    const sheet = currentWorkbook.Sheets[sheetName];
+    if (!sheet) return;
+
+    if (
+      hasWarehouseLayout(sheet) &&
+      !isSummarySheetName(sheetName) &&
+      !isPackUnitSheetName(sheetName)
+    ) {
+      const reportData = collectWarehouseReportData(currentWorkbook, sheetName);
+      if (!reportData || reportData.maxCols < 1) return;
+      const ws = excelWb.addWorksheet(sheetName);
+      let dimSheet = sheet;
+      const candidate = dimWorkbook?.Sheets?.[sheetName];
+      if (candidate && hasWarehouseLayout(candidate) && !sheetHasBrokenColumnDims(candidate)) {
+        dimSheet = candidate;
+      } else if (sheetHasBrokenColumnDims(sheet) && candidate && hasWarehouseLayout(candidate)) {
+        dimSheet = candidate;
+      }
+      paintWarehouseSheetLikeHtml(ws, reportData, sheet, dimSheet);
+      return;
+    }
+
+    // TOTAL / 입수량 등
+    const ws = excelWb.addWorksheet(sheetName);
+    copySheetJsToExcelJsWorksheet(sheet, ws);
+  });
+
+  if (excelWb.worksheets.length === 0) {
+    throw new Error("내보낼 창고 도면 시트가 없습니다.");
+  }
+
+  // 숨김 해제 + 최소 너비 강제 (Excel에서 열이 사라지지 않게)
+  excelWb.eachSheet((ws) => {
+    if (ws.name.toUpperCase() === "TOTAL" || ws.name.includes("합계") || isPackUnitSheetName(ws.name)) {
+      return;
+    }
+    const maxC = Math.max(ws.actualColumnCount || 0, ws.columnCount || 0, 30);
+    for (let i = 1; i <= maxC; i++) {
+      const col = ws.getColumn(i);
+      col.hidden = false;
+      if (col.width == null || col.width < 3) {
+        col.width = i === 1 ? 4.5 : 6;
+      }
+    }
+  });
+
+  return excelWb.xlsx.writeBuffer();
+}
+
+/**
+ * 6. 수정된 파일 export (다운로드)
+ * HTML 보고서 도면 배치도와 동일한 격자로 엑셀을 생성한다.
+ */
+async function exportUpdatedExcel() {
   if (!currentWorkbook) return;
 
   setGlobalLoading(true, "🟡 엑셀 생성 중...");
   try {
-    aggregateTotalSheet(currentWorkbook);
-    applyExcelStyles(currentWorkbook);
-    const wbout = XLSX.write(currentWorkbook, { bookType: "xlsx", type: "array", cellStyles: true });
-    const blob = new Blob([wbout], { type: "application/octet-stream" });
-    const filename = `재고조사표_수정본_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    const buffer = await buildExportBufferMatchingHtmlLayout();
+    const bytes = new Uint8Array(buffer);
+
+    // 검증: 창고 시트 랙 열·숨김 열
+    if (window.ExcelJS) {
+      const checkWb = new window.ExcelJS.Workbook();
+      await checkWb.xlsx.load(bytes);
+      let hiddenCount = 0;
+      let maxRackHeaders = 0;
+      checkWb.eachSheet((ws) => {
+        if (ws.name.toUpperCase() === "TOTAL" || ws.name.includes("합계") || isPackUnitSheetName(ws.name)) {
+          return;
+        }
+        for (let i = 1; i <= Math.max(ws.columnCount, 30); i++) {
+          if (ws.getColumn(i).hidden) hiddenCount++;
+        }
+        // 4행 랙번호 개수
+        let headers = 0;
+        for (let c = 1; c <= 40; c++) {
+          const v = ws.getCell(4, c).value;
+          if (v !== null && v !== undefined && v !== "" && !Number.isNaN(Number(v))) headers++;
+        }
+        maxRackHeaders = Math.max(maxRackHeaders, headers);
+      });
+      let tooNarrow = 0;
+      checkWb.eachSheet((ws) => {
+        if (ws.name.toUpperCase() === "TOTAL" || ws.name.includes("합계") || isPackUnitSheetName(ws.name)) {
+          return;
+        }
+        for (let i = 1; i <= Math.min(ws.columnCount || 20, 25); i++) {
+          const w = ws.getColumn(i).width;
+          if (w != null && w < 3) tooNarrow += 1;
+        }
+      });
+      if (hiddenCount > 0) {
+        throw new Error(`다운로드 파일에 숨김 열이 ${hiddenCount}개 있습니다. Ctrl+F5 후 다시 다운로드해 주세요.`);
+      }
+      if (tooNarrow >= 4) {
+        throw new Error("다운로드 파일 열 너비가 비정상적으로 좁습니다. Ctrl+F5 후 다시 다운로드해 주세요.");
+      }
+      if (maxRackHeaders < 2) {
+        throw new Error("다운로드 파일 도면 열이 부족합니다. 화면의 구역 도면을 확인한 뒤 다시 시도해 주세요.");
+      }
+    }
+
+    const blob = new Blob([bytes], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const filename = `재고조사표_화면도면_${new Date().toISOString().slice(0, 10)}.xlsx`;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -2465,9 +3268,9 @@ function exportUpdatedExcel() {
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
     }, 0);
-    showToast(`다운로드: ${filename}`, "success", 4000);
+    showToast(`다운로드: ${filename} (열너비 정상 · 숨김열 없음)`, "success", 4000);
   } catch (err) {
-    alert("엑셀 파일을 생성하고 다운로드하는 도중 오류가 발생했습니다.");
+    alert(err.message || "엑셀 파일을 생성하고 다운로드하는 도중 오류가 발생했습니다.");
     console.error(err);
   } finally {
     setGlobalLoading(false);
@@ -3133,8 +3936,9 @@ function writeTotalCell(totalSheet, excelRow, col, val, type = "n") {
     delete totalSheet[addr];
     return;
   }
+  const keepStyle = totalSheet[addr]?.s;
   totalSheet[addr] = { t: type, v: val };
-  delete totalSheet[addr].w;
+  if (keepStyle) totalSheet[addr].s = keepStyle;
 }
 
 function collectWarehouseProductData(workbook) {
@@ -3281,18 +4085,27 @@ function aggregateTotalSheet(workbook) {
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.LOCATION, locationText, "s");
     writeTotalCell(totalSheet, excelRow, TOTAL_COL.CHECK, checkLabel, "s");
 
-    totalSheet[totalCellAddr(excelRow, TOTAL_COL.STOCK)] = {
+    const stockAddr = totalCellAddr(excelRow, TOTAL_COL.STOCK);
+    const sumAddr = totalCellAddr(excelRow, TOTAL_COL.SUM);
+    const diffAddr = totalCellAddr(excelRow, TOTAL_COL.DIFF);
+    const stockStyle = totalSheet[stockAddr]?.s;
+    const sumStyle = totalSheet[sumAddr]?.s;
+    const diffStyle = totalSheet[diffAddr]?.s;
+    totalSheet[stockAddr] = {
       t: "n",
       f: `((D${excelRow}*C${excelRow})+E${excelRow})*B${excelRow}+F${excelRow}`,
     };
-    totalSheet[totalCellAddr(excelRow, TOTAL_COL.SUM)] = {
+    totalSheet[sumAddr] = {
       t: "n",
       f: `G${excelRow}+H${excelRow}`,
     };
-    totalSheet[totalCellAddr(excelRow, TOTAL_COL.DIFF)] = {
+    totalSheet[diffAddr] = {
       t: "n",
       f: `I${excelRow}-J${excelRow}`,
     };
+    if (stockStyle) totalSheet[stockAddr].s = stockStyle;
+    if (sumStyle) totalSheet[sumAddr].s = sumStyle;
+    if (diffStyle) totalSheet[diffAddr].s = diffStyle;
   });
 
   if (totalSheet["!ref"]) {
@@ -3391,8 +4204,9 @@ function computeWarehousePrintColumnWidths(sheet, colMapping, maxCols, maxRows, 
     const isTrailingEmpty = c > lastStockRack && !hasStock;
 
     if (isTrailingEmpty) {
-      widths[pCol] = { wch: 2.2, hidden: true };
-      widths[bCol] = { wch: 2, hidden: true };
+      // 숨기지 않음 — 숨김/초협폭은 Excel에서 열이 사라진 것처럼 보임
+      widths[pCol] = { wch: 6 };
+      widths[bCol] = { wch: 5 };
       continue;
     }
 
@@ -3502,9 +4316,11 @@ function buildDenseColumnWidths(widthMap, lastColIdx, aisleCols) {
   const cols = [];
   for (let i = 0; i <= lastColIdx; i++) {
     if (widthMap[i]) {
-      cols[i] = { ...widthMap[i] };
+      const { hidden, ...rest } = widthMap[i];
+      cols[i] = { ...rest, hidden: false };
+      if (cols[i].wch != null) cols[i].wch = Math.max(3, cols[i].wch);
     } else {
-      cols[i] = aisleCols.has(i) ? { wch: 1.8 } : { wch: 3 };
+      cols[i] = aisleCols.has(i) ? { wch: 3 } : { wch: 5 };
     }
   }
   return cols;
@@ -4250,14 +5066,28 @@ async function loadDataFromSupabase() {
     if (archived) {
       workbookBytes = archived.bytes;
       templateSource = archived.source;
-    } else if (inventoryRacks.length > 0) {
-      currentWorkbook = buildWorkbookFromDbInventory(dbRacks, layoutRows);
-      templateSource = layoutRows.length > 0 ? "db-layout" : "db-generated";
-    } else {
+      // 깨진 DB도면이 캐시/스냅샷에 들어있으면 원본으로 쓰지 않음
+      if (isWorkbookLayoutHealthy(workbookBytes)) {
+        rememberPristineLayoutBytes(workbookBytes);
+      } else {
+        console.warn("복원 엑셀 레이아웃이 불완전하여 원본 레이아웃으로 사용하지 않습니다.");
+        workbookBytes = null;
+      }
+    }
+
+    if (!workbookBytes) {
+      // 깨진 캐시/아카이브 대신 번들 템플릿(B1·B2·B3·W2 전체 도면) 우선
       try {
         workbookBytes = await loadBundledWorkbookBytes();
+        rememberPristineLayoutBytes(workbookBytes);
+        templateSource = "bundled";
       } catch (e) {
-        throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+        if (inventoryRacks.length > 0) {
+          currentWorkbook = buildWorkbookFromDbInventory(dbRacks, layoutRows);
+          templateSource = layoutRows.length > 0 ? "db-layout" : "db-generated";
+        } else {
+          throw new Error("엑셀 템플릿 파일(재고조사표.xlsx)을 불러오는 데 실패했습니다 (네트워크 오류).");
+        }
       }
     }
 
@@ -4267,10 +5097,29 @@ async function loadDataFromSupabase() {
       currentWorkbook = XLSX.read(workbookBytes, { type: "array", cellStyles: true });
     }
 
+    // DB에만 있는 시트는 원본 워크북에 추가만 하고, 전체 도면을 DB생으로 교체하지 않음
     let sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
-    if (sheetMismatch.length > 0 && inventoryRacks.length > 0) {
-      currentWorkbook = buildWorkbookFromDbInventory(dbRacks, layoutRows);
-      templateSource = layoutRows.length > 0 ? "db-layout" : "db-generated";
+    if (sheetMismatch.length > 0 && inventoryRacks.length > 0 && currentWorkbook) {
+      const layoutMap = getLayoutMapFromDb(layoutRows);
+      sheetMismatch.forEach((sheetName) => {
+        if (currentWorkbook.Sheets[sheetName]) return;
+        const racks = inventoryRacks.filter((r) => r.sheet_name === sheetName);
+        const layout = layoutMap[sheetName];
+        const maxRow =
+          layout?.maxRows ||
+          (racks.length ? Math.max(18, ...racks.map((r) => r.rack_row)) : 18);
+        let totalCols = 11;
+        if (layout?.leftCols || layout?.rightCols) {
+          totalCols = (layout.leftCols || 0) + (layout.rightCols || 0) || 11;
+        } else if (racks.length) {
+          totalCols = Math.max(11, ...racks.map((r) => r.rack_col));
+        }
+        XLSX.utils.book_append_sheet(
+          currentWorkbook,
+          createWarehouseLayoutSheet(sheetName, totalCols, maxRow),
+          sheetName
+        );
+      });
       sheetMismatch = getSheetMismatch(dbRacks, currentWorkbook);
     }
 
@@ -4357,6 +5206,12 @@ async function loadDataFromSupabase() {
       syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
       syncStatusEl.style.border = "1px solid rgba(16, 185, 129, 0.4)";
       syncStatusEl.style.color = "#10b981";
+      // 이 PC에만 있는 엑셀이면 B1/B2/B3 등 빈 구역이 다른 기기에 안 보임 → 클라우드에 재게시
+      persistUploadedWorkbook(currentWorkbook).then((ok) => {
+        if (ok) {
+          syncStatusEl.textContent = "🟢 실시간 동기화 중 (엑셀 클라우드 재게시됨)";
+        }
+      }).catch((e) => console.warn("로컬 엑셀 클라우드 재게시 실패:", e));
     } else if (inventoryRacks.length > 0) {
       syncStatusEl.textContent = "🟢 실시간 동기화 중 (재고 데이터 연결됨)";
       syncStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
