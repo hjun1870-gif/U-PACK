@@ -3081,14 +3081,14 @@ function paintWarehouseSheetLikeHtml(ws, reportData, sourceSheet, dimSourceSheet
   });
 }
 
-/** SheetJS 시트를 ExcelJS로 값 복사 (TOTAL·입수량 등) */
+/** SheetJS 시트를 ExcelJS로 값 복사 (폴백용) */
 function copySheetJsToExcelJsWorksheet(sheetJs, ws) {
   if (!sheetJs || !sheetJs["!ref"]) return;
   const range = XLSX.utils.decode_range(sheetJs["!ref"]);
   for (let r = range.s.r; r <= range.e.r; r++) {
     for (let c = range.s.c; c <= range.e.c; c++) {
       const src = sheetJs[XLSX.utils.encode_cell({ r, c })];
-      if (!src || src.v === undefined) continue;
+      if (!src || (src.v === undefined && !src.f)) continue;
       const cell = ws.getCell(r + 1, c + 1);
       if (src.f) cell.value = { formula: String(src.f).replace(/^=/, "") };
       else if (src.t === "n" || typeof src.v === "number") cell.value = Number(src.v) || 0;
@@ -3108,6 +3108,254 @@ function copySheetJsToExcelJsWorksheet(sheetJs, ws) {
     ws.getColumn(idx + 1).width = col.wch || col.width || 10;
     ws.getColumn(idx + 1).hidden = false;
   });
+}
+
+const EXCELJS_THIN_BLACK = {
+  top: { style: "thin", color: { argb: "FF000000" } },
+  bottom: { style: "thin", color: { argb: "FF000000" } },
+  left: { style: "thin", color: { argb: "FF000000" } },
+  right: { style: "thin", color: { argb: "FF000000" } },
+};
+const EXCELJS_THIN_GRAY = {
+  top: { style: "thin", color: { argb: "FFBDBDBD" } },
+  bottom: { style: "thin", color: { argb: "FFBDBDBD" } },
+  left: { style: "thin", color: { argb: "FFBDBDBD" } },
+  right: { style: "thin", color: { argb: "FFBDBDBD" } },
+};
+
+function excelJsFill(hex) {
+  return { type: "pattern", pattern: "solid", fgColor: { argb: "FF" + hex } };
+}
+
+/**
+ * 입수량 박스단위 시트 — 원본(수정본)과 동일한 레이아웃·서식
+ * 헤더 2행(제품명/입수량/박스단위), 데이터 3행~, 네이비 헤더·검정 테두리
+ */
+function paintPackUnitSheetLikeOriginal(ws, sheetJs) {
+  const headerRowIdx = detectPackUnitHeaderRow(sheetJs); // 0-based
+  const dataStartIdx = headerRowIdx + 1;
+  const lastDataIdx = detectPackUnitLastDataRow(sheetJs, dataStartIdx);
+  const headerExcelRow = headerRowIdx + 1;
+  const dataStartExcelRow = dataStartIdx + 1;
+
+  // 원본 치수 (재고조사표_수정본 기준) + SheetJS !cols 우선
+  const srcCols = sheetJs["!cols"] || [];
+  ws.getColumn(1).width = Math.max(14, srcCols[0]?.wch || 19);
+  ws.getColumn(2).width = Math.max(8, srcCols[1]?.wch || 10);
+  ws.getColumn(3).width = Math.max(10, srcCols[2]?.wch || 12);
+  [1, 2, 3].forEach((c) => {
+    ws.getColumn(c).hidden = false;
+  });
+
+  const headers = ["제품명", "입수량", "박스단위"];
+  for (let c = 0; c < 3; c++) {
+    const cell = ws.getCell(headerExcelRow, c + 1);
+    const src = sheetJs[XLSX.utils.encode_cell({ r: headerRowIdx, c })];
+    cell.value = src?.v != null ? String(src.v) : headers[c];
+    cell.fill = excelJsFill("1E3A5F");
+    cell.font = { name: "맑은 고딕", size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+    cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+    cell.border = EXCELJS_THIN_BLACK;
+  }
+  ws.getRow(headerExcelRow).height = getSourceRowHeight(sheetJs, headerRowIdx, 18);
+
+  let rowNum = 0;
+  for (let r = dataStartIdx; r <= lastDataIdx; r++) {
+    const excelRow = r + 1;
+    const odd = rowNum % 2 === 0;
+    rowNum += 1;
+    ws.getRow(excelRow).height = getSourceRowHeight(sheetJs, r, 16);
+
+    const bg = odd ? "FFFFFF" : "F8FAFC";
+    const prodSrc = sheetJs[XLSX.utils.encode_cell({ r, c: 0 })];
+    const ipsurSrc = sheetJs[XLSX.utils.encode_cell({ r, c: 1 })];
+    const boxSrc = sheetJs[XLSX.utils.encode_cell({ r, c: 2 })];
+
+    const prodCell = ws.getCell(excelRow, 1);
+    prodCell.value = prodSrc?.v != null ? String(prodSrc.v) : "";
+    prodCell.fill = excelJsFill(bg);
+    prodCell.font = { name: "맑은 고딕", size: 9, bold: true, color: { argb: "FF000000" } };
+    prodCell.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+    prodCell.border = EXCELJS_THIN_BLACK;
+
+    const ipsurCell = ws.getCell(excelRow, 2);
+    ipsurCell.value =
+      ipsurSrc?.v !== undefined && ipsurSrc?.v !== "" ? Number(ipsurSrc.v) || 0 : "";
+    ipsurCell.fill = excelJsFill(bg);
+    ipsurCell.font = { name: "맑은 고딕", size: 9, color: { argb: "FF000000" } };
+    ipsurCell.alignment = { vertical: "middle", horizontal: "center" };
+    ipsurCell.border = EXCELJS_THIN_BLACK;
+
+    const boxCell = ws.getCell(excelRow, 3);
+    boxCell.value = boxSrc?.v !== undefined && boxSrc?.v !== "" ? Number(boxSrc.v) || 0 : "";
+    boxCell.fill = excelJsFill(bg);
+    boxCell.font = { name: "맑은 고딕", size: 9, color: { argb: "FF000000" } };
+    boxCell.alignment = { vertical: "middle", horizontal: "center" };
+    boxCell.border = EXCELJS_THIN_BLACK;
+  }
+
+  // 원본에 제목 행이 있으면 유지
+  if (headerRowIdx > 0) {
+    const titleSrc = sheetJs[XLSX.utils.encode_cell({ r: headerRowIdx - 1, c: 0 })];
+    if (titleSrc?.v) {
+      try {
+        ws.mergeCells(headerExcelRow - 1, 1, headerExcelRow - 1, 3);
+      } catch (_) {
+        /* ignore */
+      }
+      const titleCell = ws.getCell(headerExcelRow - 1, 1);
+      titleCell.value = String(titleSrc.v);
+      titleCell.font = { name: "맑은 고딕", size: 12, bold: true };
+      titleCell.alignment = { vertical: "middle", horizontal: "center" };
+      ws.getRow(headerExcelRow - 1).height = getSourceRowHeight(sheetJs, headerRowIdx - 1, 22);
+    }
+  }
+
+  ws.views = [{ state: "normal", showGridLines: true }];
+}
+
+/**
+ * TOTAL 시트 — 원본(수정본)과 동일한 레이아웃·서식·수식
+ * G=((D*C)+E)*B+F , I=G+H , K=I-J
+ */
+function paintTotalSheetLikeOriginal(ws, sheetJs) {
+  const headers = [
+    "제품명",
+    "입수량",
+    "박스단위",
+    "P",
+    "B",
+    "잔량(ea)",
+    "재고",
+    "출고",
+    "합계",
+    "판매일보",
+    "차이",
+    "창고위치",
+    "창고일치",
+  ];
+  const colWidths = [14, 8, 8, 8, 8, 10, 12, 12, 12, 12, 10, 16, 10];
+  const srcCols = sheetJs["!cols"] || [];
+  colWidths.forEach((w, idx) => {
+    ws.getColumn(idx + 1).width = Math.max(w, srcCols[idx]?.wch || w);
+    ws.getColumn(idx + 1).hidden = false;
+  });
+
+  // 헤더 4행
+  ws.getRow(TOTAL_HEADER_ROW).height = getSourceRowHeight(sheetJs, TOTAL_HEADER_ROW - 1, 22);
+  for (let c = 0; c < headers.length; c++) {
+    const cell = ws.getCell(TOTAL_HEADER_ROW, c + 1);
+    const src = sheetJs[XLSX.utils.encode_cell({ r: TOTAL_HEADER_ROW - 1, c })];
+    cell.value = src?.v != null ? String(src.v) : headers[c];
+    cell.fill = excelJsFill("1E3A5F");
+    cell.font = { name: "맑은 고딕", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
+    cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+    cell.border = EXCELJS_THIN_GRAY;
+  }
+
+  const lastRow = getTotalSheetLastDataRow(sheetJs);
+  for (let excelRow = TOTAL_DATA_START_ROW; excelRow <= lastRow; excelRow++) {
+    const isOdd = excelRow % 2 !== 0;
+    ws.getRow(excelRow).height = getSourceRowHeight(sheetJs, excelRow - 1, 15);
+
+    const readVal = (col0) => {
+      const src = sheetJs[totalCellAddr(excelRow, col0)];
+      return src;
+    };
+
+    const prodSrc = readVal(TOTAL_COL.PRODUCT);
+    if (!prodSrc || prodSrc.v === undefined || String(prodSrc.v).trim() === "") break;
+
+    const applyStyle = (cell, fillHex, fontOpts, align = "center") => {
+      cell.fill = excelJsFill(fillHex);
+      cell.font = { name: "맑은 고딕", size: 9, ...fontOpts };
+      cell.alignment = { vertical: "middle", horizontal: align, wrapText: align === "center" };
+      cell.border = EXCELJS_THIN_GRAY;
+    };
+
+    // A 제품명
+    const a = ws.getCell(excelRow, 1);
+    a.value = String(prodSrc.v).trim();
+    applyStyle(a, isOdd ? "F0FDF4" : "DCFCE7", { bold: true, size: 9, color: { argb: "FF1B4332" } });
+
+    // B 입수량, C 박스단위
+    const b = ws.getCell(excelRow, 2);
+    const c = ws.getCell(excelRow, 3);
+    const bSrc = readVal(TOTAL_COL.IPSUR);
+    const cSrc = readVal(TOTAL_COL.BOX_UNIT);
+    b.value = bSrc?.v !== undefined && bSrc?.v !== "" ? Number(bSrc.v) || 0 : "";
+    c.value = cSrc?.v !== undefined && cSrc?.v !== "" ? Number(cSrc.v) || 0 : "";
+    applyStyle(b, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } });
+    applyStyle(c, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } });
+
+    // D P, E B
+    const d = ws.getCell(excelRow, 4);
+    const e = ws.getCell(excelRow, 5);
+    const dSrc = readVal(TOTAL_COL.PALLET);
+    const eSrc = readVal(TOTAL_COL.BOX);
+    d.value = dSrc?.v !== undefined && dSrc?.v !== "" ? Number(dSrc.v) || 0 : "";
+    e.value = eSrc?.v !== undefined && eSrc?.v !== "" ? Number(eSrc.v) || 0 : "";
+    applyStyle(d, isOdd ? "EFF6FF" : "DBEAFE", {
+      bold: true,
+      size: 10,
+      color: { argb: "FF1D4ED8" },
+    });
+    applyStyle(e, isOdd ? "FFF1F2" : "FFE4E6", {
+      bold: true,
+      size: 10,
+      color: { argb: "FFBE123C" },
+    });
+
+    // F 잔량
+    const f = ws.getCell(excelRow, 6);
+    const fSrc = readVal(TOTAL_COL.JAN);
+    f.value = fSrc?.v !== undefined && fSrc?.v !== "" ? Number(fSrc.v) || 0 : "";
+    applyStyle(f, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } });
+
+    // G 재고 수식, H 출고, I 합계 수식, J 판매일보, K 차이 수식
+    const g = ws.getCell(excelRow, 7);
+    const h = ws.getCell(excelRow, 8);
+    const i = ws.getCell(excelRow, 9);
+    const j = ws.getCell(excelRow, 10);
+    const k = ws.getCell(excelRow, 11);
+    g.value = { formula: `((D${excelRow}*C${excelRow})+E${excelRow})*B${excelRow}+F${excelRow}` };
+    const hSrc = readVal(TOTAL_COL.CHULGO);
+    h.value = hSrc?.v !== undefined && hSrc?.v !== "" ? Number(hSrc.v) || 0 : "";
+    i.value = { formula: `G${excelRow}+H${excelRow}` };
+    const jSrc = readVal(TOTAL_COL.PANMAE);
+    j.value = jSrc?.v !== undefined && jSrc?.v !== "" ? Number(jSrc.v) || 0 : "";
+    k.value = { formula: `I${excelRow}-J${excelRow}` };
+    [g, h, i, j, k].forEach((cell) =>
+      applyStyle(cell, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } })
+    );
+
+    // L 창고위치
+    const l = ws.getCell(excelRow, 12);
+    const lSrc = readVal(TOTAL_COL.LOCATION);
+    l.value = lSrc?.v != null ? String(lSrc.v) : "";
+    applyStyle(l, isOdd ? "FAF5FF" : "F3E8FF", { size: 9, color: { argb: "FF5B21B6" } });
+
+    // M 창고일치
+    const m = ws.getCell(excelRow, 13);
+    const mSrc = readVal(TOTAL_COL.CHECK);
+    const checkLabel = mSrc?.v != null ? String(mSrc.v).trim() : "";
+    m.value = checkLabel;
+    if (checkLabel === "불일치") {
+      applyStyle(m, isOdd ? "FEF2F2" : "FEE2E2", {
+        bold: true,
+        size: 9,
+        color: { argb: "FFB91C1C" },
+      });
+    } else {
+      applyStyle(m, isOdd ? "F0FDF4" : "DCFCE7", {
+        bold: true,
+        size: 9,
+        color: { argb: "FF166534" },
+      });
+    }
+  }
+
+  ws.views = [{ state: "normal", showGridLines: true }];
 }
 
 /**
@@ -3173,7 +3421,21 @@ async function buildExportBufferMatchingHtmlLayout() {
       return;
     }
 
-    // TOTAL / 입수량 등
+    // 입수량 박스단위 — 원본과 동일 레이아웃·서식
+    if (isPackUnitSheetName(sheetName)) {
+      const ws = excelWb.addWorksheet(sheetName);
+      paintPackUnitSheetLikeOriginal(ws, sheet);
+      return;
+    }
+
+    // TOTAL — 원본과 동일 레이아웃·서식·수식
+    if (sheetName.toUpperCase() === "TOTAL" || sheetName.includes("합계")) {
+      const ws = excelWb.addWorksheet(sheetName);
+      paintTotalSheetLikeOriginal(ws, sheet);
+      return;
+    }
+
+    // 기타 시트 폴백
     const ws = excelWb.addWorksheet(sheetName);
     copySheetJsToExcelJsWorksheet(sheet, ws);
   });
