@@ -3278,13 +3278,20 @@ function paintTotalSheetLikeOriginal(ws, sheetJs) {
     a.value = String(prodSrc.v).trim();
     applyStyle(a, isOdd ? "F0FDF4" : "DCFCE7", { bold: true, size: 9, color: { argb: "FF1B4332" } });
 
+    // 숫자 셀: 빈 문자열("")이면 Excel 수식이 #VALUE! → null(빈칸=0) 또는 숫자만 기록
+    const toNumOrNull = (src) => {
+      if (src?.v === undefined || src?.v === null || src?.v === "") return null;
+      const n = Number(src.v);
+      return Number.isFinite(n) ? n : null;
+    };
+
     // B 입수량, C 박스단위
     const b = ws.getCell(excelRow, 2);
     const c = ws.getCell(excelRow, 3);
     const bSrc = readVal(TOTAL_COL.IPSUR);
     const cSrc = readVal(TOTAL_COL.BOX_UNIT);
-    b.value = bSrc?.v !== undefined && bSrc?.v !== "" ? Number(bSrc.v) || 0 : "";
-    c.value = cSrc?.v !== undefined && cSrc?.v !== "" ? Number(cSrc.v) || 0 : "";
+    b.value = toNumOrNull(bSrc);
+    c.value = toNumOrNull(cSrc);
     applyStyle(b, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } });
     applyStyle(c, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } });
 
@@ -3293,8 +3300,8 @@ function paintTotalSheetLikeOriginal(ws, sheetJs) {
     const e = ws.getCell(excelRow, 5);
     const dSrc = readVal(TOTAL_COL.PALLET);
     const eSrc = readVal(TOTAL_COL.BOX);
-    d.value = dSrc?.v !== undefined && dSrc?.v !== "" ? Number(dSrc.v) || 0 : "";
-    e.value = eSrc?.v !== undefined && eSrc?.v !== "" ? Number(eSrc.v) || 0 : "";
+    d.value = toNumOrNull(dSrc);
+    e.value = toNumOrNull(eSrc);
     applyStyle(d, isOdd ? "EFF6FF" : "DBEAFE", {
       bold: true,
       size: 10,
@@ -3309,7 +3316,7 @@ function paintTotalSheetLikeOriginal(ws, sheetJs) {
     // F 잔량
     const f = ws.getCell(excelRow, 6);
     const fSrc = readVal(TOTAL_COL.JAN);
-    f.value = fSrc?.v !== undefined && fSrc?.v !== "" ? Number(fSrc.v) || 0 : "";
+    f.value = toNumOrNull(fSrc);
     applyStyle(f, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } });
 
     // G 재고 수식, H 출고, I 합계 수식, J 판매일보, K 차이 수식
@@ -3318,13 +3325,16 @@ function paintTotalSheetLikeOriginal(ws, sheetJs) {
     const i = ws.getCell(excelRow, 9);
     const j = ws.getCell(excelRow, 10);
     const k = ws.getCell(excelRow, 11);
-    g.value = { formula: `((D${excelRow}*C${excelRow})+E${excelRow})*B${excelRow}+F${excelRow}` };
+    // N()으로 빈칸·텍스트를 0 처리해 #VALUE! 방지
+    g.value = {
+      formula: `((N(D${excelRow})*N(C${excelRow}))+N(E${excelRow}))*N(B${excelRow})+N(F${excelRow})`,
+    };
     const hSrc = readVal(TOTAL_COL.CHULGO);
-    h.value = hSrc?.v !== undefined && hSrc?.v !== "" ? Number(hSrc.v) || 0 : "";
-    i.value = { formula: `G${excelRow}+H${excelRow}` };
+    h.value = toNumOrNull(hSrc);
+    i.value = { formula: `N(G${excelRow})+N(H${excelRow})` };
     const jSrc = readVal(TOTAL_COL.PANMAE);
-    j.value = jSrc?.v !== undefined && jSrc?.v !== "" ? Number(jSrc.v) || 0 : "";
-    k.value = { formula: `I${excelRow}-J${excelRow}` };
+    j.value = toNumOrNull(jSrc);
+    k.value = { formula: `N(I${excelRow})-N(J${excelRow})` };
     [g, h, i, j, k].forEach((cell) =>
       applyStyle(cell, isOdd ? "FFFFFF" : "F9FAFB", { size: 9, color: { argb: "FF374151" } })
     );
@@ -3332,25 +3342,36 @@ function paintTotalSheetLikeOriginal(ws, sheetJs) {
     // L 창고위치
     const l = ws.getCell(excelRow, 12);
     const lSrc = readVal(TOTAL_COL.LOCATION);
-    l.value = lSrc?.v != null ? String(lSrc.v) : "";
+    const locationText = lSrc?.v != null ? String(lSrc.v).trim() : "";
+    l.value = locationText || null;
     applyStyle(l, isOdd ? "FAF5FF" : "F3E8FF", { size: 9, color: { argb: "FF5B21B6" } });
 
-    // M 창고일치
+    // M 창고일치 — 위치 없고 재고 없으면 "-" (빈 위치를 일치로 표시하지 않음)
     const m = ws.getCell(excelRow, 13);
     const mSrc = readVal(TOTAL_COL.CHECK);
-    const checkLabel = mSrc?.v != null ? String(mSrc.v).trim() : "";
-    m.value = checkLabel;
+    let checkLabel = mSrc?.v != null ? String(mSrc.v).trim() : "";
+    const whP = toNumOrNull(dSrc) || 0;
+    const whB = toNumOrNull(eSrc) || 0;
+    if (!locationText && whP === 0 && whB === 0) {
+      checkLabel = "-";
+    }
+    m.value = checkLabel || "-";
     if (checkLabel === "불일치") {
       applyStyle(m, isOdd ? "FEF2F2" : "FEE2E2", {
         bold: true,
         size: 9,
         color: { argb: "FFB91C1C" },
       });
-    } else {
+    } else if (checkLabel === "일치") {
       applyStyle(m, isOdd ? "F0FDF4" : "DCFCE7", {
         bold: true,
         size: 9,
         color: { argb: "FF166534" },
+      });
+    } else {
+      applyStyle(m, isOdd ? "F8FAFC" : "F1F5F9", {
+        size: 9,
+        color: { argb: "FF64748B" },
       });
     }
   }
@@ -4146,11 +4167,20 @@ function readTotalSheetQuantities(totalSheet) {
 }
 
 function resolveTotalCheckLabel(originalQty, warehouseQty, hadTotalSheet) {
-  if (!hadTotalSheet) return "일치";
   const origP = originalQty?.pallet ?? 0;
   const origB = originalQty?.box ?? 0;
   const whP = warehouseQty?.pallet ?? 0;
   const whB = warehouseQty?.box ?? 0;
+  const hasLocation =
+    warehouseQty?.locations instanceof Set
+      ? warehouseQty.locations.size > 0
+      : Boolean(warehouseQty?.locations && warehouseQty.locations.length);
+
+  // 창고위치가 없고 창고 재고도 없으면 일치/불일치 판정 대상이 아님
+  if (!hasLocation && whP === 0 && whB === 0) {
+    return "-";
+  }
+  if (!hadTotalSheet) return "일치";
   return origP === whP && origB === whB ? "일치" : "불일치";
 }
 
@@ -4172,6 +4202,7 @@ function updateTotalMatchSummary(workbook) {
     const label = checkCell?.v !== undefined ? String(checkCell.v).trim() : "";
     if (label === "일치") matchCount += 1;
     else if (label === "불일치") mismatchCount += 1;
+    // "-" (미배치)는 집계에서 제외
   }
 
   if (matchCount === 0 && mismatchCount === 0) {
@@ -4355,15 +4386,15 @@ function aggregateTotalSheet(workbook) {
     const diffStyle = totalSheet[diffAddr]?.s;
     totalSheet[stockAddr] = {
       t: "n",
-      f: `((D${excelRow}*C${excelRow})+E${excelRow})*B${excelRow}+F${excelRow}`,
+      f: `((N(D${excelRow})*N(C${excelRow}))+N(E${excelRow}))*N(B${excelRow})+N(F${excelRow})`,
     };
     totalSheet[sumAddr] = {
       t: "n",
-      f: `G${excelRow}+H${excelRow}`,
+      f: `N(G${excelRow})+N(H${excelRow})`,
     };
     totalSheet[diffAddr] = {
       t: "n",
-      f: `I${excelRow}-J${excelRow}`,
+      f: `N(I${excelRow})-N(J${excelRow})`,
     };
     if (stockStyle) totalSheet[stockAddr].s = stockStyle;
     if (sumStyle) totalSheet[sumAddr].s = sumStyle;
@@ -5181,6 +5212,13 @@ function applyTotalSheetStyles(sheet) {
     border
   });
 
+  const sCheckNeutral = (isOdd) => ({
+    font: { name: fontName, sz: 9, color: { rgb: "64748B" } },
+    fill: { patternType: "solid", fgColor: { rgb: isOdd ? "F8FAFC" : "F1F5F9" } },
+    alignment: { vertical: "center", horizontal: "center" },
+    border
+  });
+
   // ── 4행 헤더 스타일 적용 (A~M 열) ──────────
   for (let col = 0; col <= TOTAL_COL.CHECK; col++) {
     const addr = XLSX.utils.encode_cell({ r: 3, c: col }); // 4행 = r:3
@@ -5227,7 +5265,9 @@ function applyTotalSheetStyles(sheet) {
     const checkCell = sheet[checkAddr];
     if (checkCell) {
       const label = String(checkCell.v || "").trim();
-      checkCell.s = label === "불일치" ? sCheckMismatch(isOdd) : sCheckMatch(isOdd);
+      if (label === "불일치") checkCell.s = sCheckMismatch(isOdd);
+      else if (label === "일치") checkCell.s = sCheckMatch(isOdd);
+      else checkCell.s = sCheckNeutral(isOdd);
     }
   }
 
